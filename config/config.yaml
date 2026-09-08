@@ -1,0 +1,13 @@
+ocr:
+  model_name: 'Qwen/Qwen3-VL-4B-Instruct'
+  use_flash_attention: true
+
+storage:
+  base_dir: 'storage/buckets'
+  max_quota_gb: 10
+
+paths:
+  raw_data: 'data/raw'
+  processed_data: 'data/processed'
+  outputs: 'outputs'
+  logs: 'logs'

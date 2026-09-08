@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# Environments
+venv/
+env/
+.venv/
+
+# Frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+.vite/
+
+# Storage and runtime data
+storage/buckets/*
+!storage/buckets/.gitkeep
+test_*.pdf
+*.tmp
+
+# Datasets and outputs
+data/
+outputs/
+logs/
+*.log
+
+# Models
+models/*.bin
+models/*.pt
+models/*.pth
+models/*.h5
+models/*.onnx
+models/*.safetensors
+models/deberta_*/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.key
+
+# IDE and OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
