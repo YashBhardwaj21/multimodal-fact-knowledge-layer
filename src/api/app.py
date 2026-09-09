@@ -112,18 +112,24 @@ def rename_session(session_id: str, req: RenameSessionRequest):
 @app.delete("/api/sessions/{session_id}")
 def delete_session(session_id: str):
     """Delete a workspace and purge its isolated storage."""
-    success = session_manager.delete_session(session_id)
-    if not success:
-        raise HTTPException(status_code=404, detail="Workspace session not found")
+    # 1. Close and release vector store handles first so file locks are freed
     if session_id in SESSION_VECTOR_STORES:
+        try:
+            SESSION_VECTOR_STORES[session_id].close()
+        except Exception as e:
+            logger.warning(f"Error closing vector store for {session_id}: {e}")
         del SESSION_VECTOR_STORES[session_id]
+
     if session_id in SESSION_CANONICAL_DOCS:
         del SESSION_CANONICAL_DOCS[session_id]
+
+    # 2. Delete database records and storage assets
+    session_manager.delete_session(session_id)
     return {"message": f"Workspace {session_id} and storage purged successfully"}
 
 
 @app.post("/api/sessions/{session_id}/documents")
-async def upload_document(session_id: str, file: UploadFile = File(...)):
+def upload_document(session_id: str, file: UploadFile = File(...)):
     """Upload and process a PDF document into session storage."""
     session = session_manager.get_session(session_id)
     if not session:
@@ -208,6 +214,8 @@ async def upload_document(session_id: str, file: UploadFile = File(...)):
         return {
             "message": f"Successfully processed '{file.filename}'",
             "doc_id": canonical_doc.doc_id,
+            "filename": file.filename,
+            "title": canonical_doc.title,
             "pages": canonical_doc.total_pages,
             "blocks": len(canonical_doc.blocks),
             "tables": len(canonical_doc.tables),

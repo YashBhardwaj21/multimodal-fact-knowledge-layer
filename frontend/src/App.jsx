@@ -53,6 +53,14 @@ function FormattedMarkdown({ content }) {
   }
 }
 
+const UPLOAD_STAGES = [
+  { id: 0, title: 'Binary Upload & Partitioning', desc: 'Streaming PDF file into isolated workspace object storage' },
+  { id: 1, title: 'Layout & Text Analysis', desc: 'Extracting pages, text blocks, and coordinates via layout engine' },
+  { id: 2, title: 'Tables & Visual Charts', desc: 'Parsing Markdown table grids and rendering high-resolution visual crops' },
+  { id: 3, title: 'Vector Embeddings & Indexing', desc: 'Computing semantic embeddings and registering collection into vector store' },
+  { id: 4, title: 'Fact Grounding & Finalizing', desc: 'Extracting grounded evidence facts and updating workspace knowledge layer' }
+];
+
 export default function App() {
   // Navigation view: 'landing' | 'workspace'
   const [currentView, setCurrentView] = useState('landing');
@@ -87,7 +95,12 @@ export default function App() {
 
   // Upload modal state
   const [isUploading, setIsUploading] = useState(false);
-  const [uploadStatus, setUploadStatus] = useState('');
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploadStageIndex, setUploadStageIndex] = useState(0);
+  const [uploadCompleted, setUploadCompleted] = useState(false);
+  const [uploadResultSummary, setUploadResultSummary] = useState(null);
+  const [uploadError, setUploadError] = useState('');
+  const [uploadingFileName, setUploadingFileName] = useState('');
   const [showUploadModal, setShowUploadModal] = useState(false);
   const fileInputRef = useRef(null);
   const heroFileInputRef = useRef(null);
@@ -233,15 +246,34 @@ export default function App() {
       const data = await res.json();
       setSessionData(data);
 
-      if (selectDocId && data.documents) {
-        const target = data.documents.find(d => d.id === selectDocId);
-        if (target) {
-          setSelectedDoc(target);
-        } else if (data.documents.length > 0) {
-          setSelectedDoc(data.documents[0]);
+      if (data.documents && data.documents.length > 0) {
+        if (selectDocId) {
+          const cleanSelect = String(selectDocId).toLowerCase().trim();
+          const target = data.documents.find(d =>
+            (d.doc_id && String(d.doc_id).toLowerCase() === cleanSelect) ||
+            (d.id && String(d.id).toLowerCase() === cleanSelect) ||
+            (d.filename && String(d.filename).toLowerCase() === cleanSelect) ||
+            (d.filename && cleanSelect.includes(String(d.filename).toLowerCase())) ||
+            (d.title && cleanSelect.includes(String(d.title).toLowerCase()))
+          );
+          if (target) {
+            setSelectedDoc(target);
+          } else {
+            setSelectedDoc(data.documents[data.documents.length - 1]);
+          }
+        } else {
+          setSelectedDoc(prev => {
+            if (prev) {
+              const stillExists = data.documents.find(d =>
+                d.filename === prev.filename ||
+                (d.doc_id && prev.doc_id && d.doc_id === prev.doc_id) ||
+                (d.id && prev.id && d.id === prev.id)
+              );
+              if (stillExists) return stillExists;
+            }
+            return data.documents[0];
+          });
         }
-      } else if (data.documents && data.documents.length > 0) {
-        setSelectedDoc(data.documents[0]);
       } else {
         setSelectedDoc(null);
       }
@@ -356,25 +388,36 @@ export default function App() {
 
   const executeDeleteWorkspace = async () => {
     if (!deleteWsModal.session) return;
+    const targetSessionId = deleteWsModal.session.id;
     try {
-      const res = await fetch(`/api/sessions/${deleteWsModal.session.id}`, {
+      const res = await fetch(`/api/sessions/${targetSessionId}`, {
         method: 'DELETE'
       });
       if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.detail || 'Failed to delete workspace');
+        let errDetail = 'Failed to delete workspace';
+        try {
+          const err = await res.json();
+          errDetail = err.detail || err.message || errDetail;
+        } catch {
+          const text = await res.text().catch(() => '');
+          if (text) errDetail = text;
+        }
+        if (res.status !== 404) {
+          throw new Error(errDetail);
+        }
       }
 
       const updatedRes = await fetch('/api/sessions');
       const updatedSessions = await updatedRes.json();
       setSessions(updatedSessions);
 
-      if (currentSessionId === deleteWsModal.session.id) {
+      if (currentSessionId === targetSessionId) {
         if (updatedSessions.length > 0) {
           setCurrentSessionId(updatedSessions[0].id);
         } else {
           setCurrentSessionId(null);
           setSessionData(null);
+          setCurrentView('landing');
         }
       }
       await fetchStorageQuota();
@@ -382,6 +425,25 @@ export default function App() {
       setModalError('');
     } catch (err) {
       setModalError(err.message);
+      // Refresh session list just in case it was already deleted on backend
+      try {
+        const checkRes = await fetch('/api/sessions');
+        const list = await checkRes.json();
+        setSessions(list);
+        if (!list.some(s => s.id === targetSessionId)) {
+          setDeleteWsModal({ isOpen: false, session: null });
+          setModalError('');
+          if (list.length > 0) {
+            setCurrentSessionId(list[0].id);
+          } else {
+            setCurrentSessionId(null);
+            setSessionData(null);
+            setCurrentView('landing');
+          }
+        }
+      } catch (e) {
+        // ignore
+      }
     }
   };
 
@@ -399,8 +461,17 @@ export default function App() {
         method: 'DELETE'
       });
       if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.detail || 'Failed to delete document');
+        let errDetail = 'Failed to delete document';
+        try {
+          const err = await res.json();
+          errDetail = err.detail || err.message || errDetail;
+        } catch {
+          const text = await res.text().catch(() => '');
+          if (text) errDetail = text;
+        }
+        if (res.status !== 404) {
+          throw new Error(errDetail);
+        }
       }
 
       if (selectedDoc && (selectedDoc.id === docId || selectedDoc.filename === deleteDocModal.doc.filename)) {
@@ -454,11 +525,38 @@ export default function App() {
 
   const handleFileUpload = async (file) => {
     if (!file || !currentSessionId) return;
+    setShowUploadModal(true);
     setIsUploading(true);
-    setUploadStatus(`Uploading & processing ${file.name}...`);
+    setUploadProgress(15);
+    setUploadStageIndex(0);
+    setUploadCompleted(false);
+    setUploadResultSummary(null);
+    setUploadError('');
+    setUploadingFileName(file.name);
 
     const formData = new FormData();
     formData.append('file', file);
+
+    // Dynamic stage progression timers while backend processes
+    const timer1 = setTimeout(() => {
+      setUploadProgress(35);
+      setUploadStageIndex(1);
+    }, 700);
+
+    const timer2 = setTimeout(() => {
+      setUploadProgress(60);
+      setUploadStageIndex(2);
+    }, 1700);
+
+    const timer3 = setTimeout(() => {
+      setUploadProgress(82);
+      setUploadStageIndex(3);
+    }, 3000);
+
+    const timer4 = setTimeout(() => {
+      setUploadProgress(92);
+      setUploadStageIndex(4);
+    }, 4500);
 
     try {
       const res = await fetch(`/api/sessions/${currentSessionId}/documents`, {
@@ -468,17 +566,41 @@ export default function App() {
       const result = await res.json();
       if (!res.ok) throw new Error(result.detail || 'Upload failed');
 
-      setUploadStatus(`Processed: ${result.pages} pages, ${result.blocks} blocks, ${result.tables} tables.`);
-      await loadSessionDetails(currentSessionId, result.doc_id);
-      await fetchStorageQuota();
+      clearTimeout(timer1);
+      clearTimeout(timer2);
+      clearTimeout(timer3);
+      clearTimeout(timer4);
 
+      setUploadProgress(100);
+      setUploadStageIndex(5);
+      setUploadCompleted(true);
+      setUploadResultSummary(result);
+
+      // AUTOMATIC STATE REFRESH:
+      // 1. Fetch updated sessions list so workspace header & pill shows new doc count
+      await fetchSessions();
+      // 2. Load latest session details and auto-select the newly uploaded document
+      await loadSessionDetails(currentSessionId, result.doc_id || result.filename || file.name);
+      // 3. Update global storage quota widget
+      await fetchStorageQuota();
+      // 4. Ensure view is on workspace
+      setCurrentView('workspace');
+
+      // Smoothly dismiss modal after user sees the 100% completion summary
       setTimeout(() => {
         setIsUploading(false);
-        setUploadStatus('');
         setShowUploadModal(false);
-      }, 1000);
+        setUploadProgress(0);
+        setUploadCompleted(false);
+        setUploadResultSummary(null);
+        setUploadingFileName('');
+      }, 1500);
     } catch (err) {
-      setUploadStatus('Error: ' + err.message);
+      clearTimeout(timer1);
+      clearTimeout(timer2);
+      clearTimeout(timer3);
+      clearTimeout(timer4);
+      setUploadError(err.message || 'Failed to process document');
       setIsUploading(false);
     }
   };
@@ -1841,52 +1963,153 @@ export default function App() {
         </div>
       )}
 
-      {/* Upload Modal */}
+      {/* Upload Modal with Multi-Stage Buffering Monitor */}
       {showUploadModal && (
-        <div className="modal-backdrop" onClick={() => setShowUploadModal(false)}>
-          <div className="modal-dialog" onClick={(e) => e.stopPropagation()}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <h3 style={{ fontSize: '1.2rem', fontWeight: 700 }}>Upload PDF to Workspace</h3>
-              <X size={20} style={{ cursor: 'pointer' }} onClick={() => setShowUploadModal(false)} />
+        <div className="modal-backdrop" onClick={() => !isUploading && setShowUploadModal(false)}>
+          <div className="modal-dialog" style={{ maxWidth: '520px' }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+              <h3 style={{ fontSize: '1.15rem', fontWeight: 700, margin: 0, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <Upload size={20} color="var(--primary)" />
+                {isUploading || uploadCompleted ? 'Ingesting Document' : 'Upload PDF to Workspace'}
+              </h3>
+              {!isUploading && (
+                <X size={18} style={{ cursor: 'pointer', color: 'var(--text-muted)' }} onClick={() => setShowUploadModal(false)} />
+              )}
             </div>
 
-            <p style={{ fontSize: '0.88rem', color: 'var(--text-muted)' }}>
-              The uploaded file will be stored in isolated object storage for this chat and processed for text, tables, figures, and facts.
-            </p>
+            {isUploading || uploadCompleted ? (
+              <div className="upload-buffering-card">
+                <div className="upload-buffering-header">
+                  <span style={{ fontSize: '0.86rem', fontWeight: 600, color: 'var(--text-title)' }}>
+                    {uploadCompleted ? 'Ingestion Complete!' : (uploadingFileName || 'Processing Document...')}
+                  </span>
+                  <span className="upload-pct-badge">{uploadProgress}%</span>
+                </div>
 
-            <div
-              className="dropzone-inner"
-              onClick={() => fileInputRef.current?.click()}
-              onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); }}
-              onDrop={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                if (e.dataTransfer.files?.[0]) handleFileUpload(e.dataTransfer.files[0]);
-              }}
-            >
-              <Upload size={32} style={{ color: 'var(--primary)', margin: '0 auto 12px' }} />
-              <p style={{ fontWeight: 600, marginBottom: '4px' }}>Click or drag PDF here to upload</p>
-              <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Stored in isolated workspace bucket</span>
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="application/pdf"
-                style={{ display: 'none' }}
-                onChange={(e) => e.target.files?.[0] && handleFileUpload(e.target.files[0])}
-              />
-            </div>
+                {/* Progress bar track with animated shimmer */}
+                <div className="upload-progress-track">
+                  <div className="upload-progress-fill" style={{ width: `${uploadProgress}%` }}>
+                    <div className="upload-progress-shimmer" />
+                  </div>
+                </div>
 
-            {uploadStatus && (
-              <div style={{ fontSize: '0.85rem', padding: '10px', borderRadius: '8px', background: 'var(--surface-subtle)', color: 'var(--primary)', fontWeight: 600 }}>
-                {uploadStatus}
+                {/* Current Active Stage Banner */}
+                <div className="upload-active-stage-banner">
+                  {uploadCompleted ? (
+                    <CheckCircle2 size={24} color="var(--success)" style={{ flexShrink: 0 }} />
+                  ) : (
+                    <RefreshCw size={22} className="spin-animation" color="var(--primary)" style={{ flexShrink: 0 }} />
+                  )}
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <div className="upload-active-stage-title">
+                      {uploadCompleted
+                        ? 'Knowledge Layer Ready'
+                        : UPLOAD_STAGES[Math.min(uploadStageIndex, UPLOAD_STAGES.length - 1)]?.title}
+                    </div>
+                    <div className="upload-active-stage-desc">
+                      {uploadCompleted
+                        ? 'Workspace state refreshed automatically with full visual grounding.'
+                        : UPLOAD_STAGES[Math.min(uploadStageIndex, UPLOAD_STAGES.length - 1)]?.desc}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Stepper Stage Rows */}
+                <div className="upload-stepper-list">
+                  {UPLOAD_STAGES.map((stg, idx) => {
+                    const isDone = uploadCompleted || uploadStageIndex > idx;
+                    const isActive = !uploadCompleted && uploadStageIndex === idx;
+                    return (
+                      <div
+                        key={stg.id}
+                        className={`upload-step-row ${isDone ? 'completed' : ''} ${isActive ? 'active' : ''}`}
+                      >
+                        {isDone ? (
+                          <CheckCircle2 size={15} color="var(--success)" style={{ flexShrink: 0 }} />
+                        ) : isActive ? (
+                          <RefreshCw size={14} className="spin-animation" color="var(--primary)" style={{ flexShrink: 0 }} />
+                        ) : (
+                          <div className="upload-step-dot" />
+                        )}
+                        <span>{stg.title}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Extracted Metrics Summary on Complete */}
+                {uploadCompleted && uploadResultSummary && (
+                  <div className="upload-metrics-pills">
+                    <span className="upload-metric-pill">
+                      <FileText size={13} /> {uploadResultSummary.pages || 1} Pages
+                    </span>
+                    <span className="upload-metric-pill">
+                      <Layers size={13} /> {uploadResultSummary.blocks || 0} Text Blocks
+                    </span>
+                    <span className="upload-metric-pill">
+                      <Table size={13} /> {uploadResultSummary.tables || 0} Tables
+                    </span>
+                    <span className="upload-metric-pill">
+                      <Image size={13} /> {uploadResultSummary.figures || 0} Figures
+                    </span>
+                    {uploadResultSummary.new_facts > 0 && (
+                      <span className="upload-metric-pill">
+                        <Sparkles size={13} /> {uploadResultSummary.new_facts} Facts
+                      </span>
+                    )}
+                  </div>
+                )}
               </div>
-            )}
+            ) : uploadError ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', padding: '12px 0' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px', color: 'var(--danger)', background: '#fdf2f2', padding: '12px 14px', borderRadius: '8px', border: '1px solid #fecaca' }}>
+                  <AlertTriangle size={20} style={{ flexShrink: 0 }} />
+                  <span style={{ fontSize: '0.86rem', fontWeight: 600 }}>{uploadError}</span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
+                  <button className="btn-outline" onClick={() => { setUploadError(''); }}>
+                    Try Again
+                  </button>
+                  <button className="modal-btn-confirm" onClick={() => setShowUploadModal(false)}>
+                    Close
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <>
+                <p style={{ fontSize: '0.86rem', color: 'var(--text-muted)', marginBottom: '16px' }}>
+                  Select or drag a PDF document. Text, structured tables, visual figures, and grounded facts will be extracted into this workspace.
+                </p>
 
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '12px' }}>
-              <button className="btn-outline" onClick={() => setShowUploadModal(false)}>
-                Cancel
-              </button>
-            </div>
+                <div
+                  className="dropzone-inner"
+                  onClick={() => fileInputRef.current?.click()}
+                  onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (e.dataTransfer.files?.[0]) handleFileUpload(e.dataTransfer.files[0]);
+                  }}
+                >
+                  <Upload size={32} style={{ color: 'var(--primary)', margin: '0 auto 12px' }} />
+                  <p style={{ fontWeight: 600, marginBottom: '4px' }}>Click or drag PDF here to upload</p>
+                  <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Stored in isolated workspace partition</span>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="application/pdf"
+                    style={{ display: 'none' }}
+                    onChange={(e) => e.target.files?.[0] && handleFileUpload(e.target.files[0])}
+                  />
+                </div>
+
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '12px', marginTop: '16px' }}>
+                  <button className="btn-outline" onClick={() => setShowUploadModal(false)}>
+                    Cancel
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}

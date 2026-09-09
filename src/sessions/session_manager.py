@@ -145,7 +145,7 @@ class SessionManager:
         if self.db_path != ":memory:":
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
 
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self.sessions: Dict[str, WorkspaceSession] = {}
         self._init_db()
         self._load_from_db()
@@ -377,6 +377,22 @@ class SessionManager:
                         ))
 
                     self.sessions[session.id] = session
+
+                if len(self.sessions) == 0:
+                    default_id = f"workspace_{uuid.uuid4().hex[:8]}"
+                    now_str = datetime.now().isoformat()
+                    with conn:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO workspaces (id, title, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                            (default_id, "Workspace 1", "Interactive document intelligence workspace.", now_str, now_str)
+                        )
+                    self.sessions[default_id] = WorkspaceSession(
+                        session_id=default_id,
+                        title="Workspace 1",
+                        description="Interactive document intelligence workspace.",
+                        created_at=now_str,
+                        updated_at=now_str
+                    )
             finally:
                 conn.close()
 
@@ -445,7 +461,10 @@ class SessionManager:
                     conn.execute("DELETE FROM workspaces WHERE id = ?", (session_id,))
                 if session_id in self.sessions:
                     del self.sessions[session_id]
-                self.object_store.delete_session_storage(session_id)
+                try:
+                    self.object_store.delete_session_storage(session_id)
+                except Exception as e:
+                    logger.warning(f"Storage purge warning for workspace {session_id}: {e}")
             finally:
                 conn.close()
 
@@ -483,6 +502,16 @@ class SessionManager:
             conn = self._get_conn()
             try:
                 with conn:
+                    # 0. Guarantee workspace exists in workspaces table to satisfy foreign key
+                    ws_row = conn.execute("SELECT id FROM workspaces WHERE id = ?", (session_id,)).fetchone()
+                    if not ws_row:
+                        ws_title = session.title if session else "Active Workspace"
+                        ws_desc = session.description if session else ""
+                        conn.execute(
+                            "INSERT OR REPLACE INTO workspaces (id, title, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                            (session_id, ws_title, ws_desc, now, now)
+                        )
+
                     # 1. Insert or replace document record
                     conn.execute("""
                         INSERT OR REPLACE INTO documents (
@@ -530,9 +559,12 @@ class SessionManager:
                                     f.evidence.verbatim_quote, f.evidence.table_citation, f.evidence.image_citation
                                 ))
 
-                    # 4. Insert fact relationships
+                    # 4. Insert fact relationships (guarantee facts exist to satisfy foreign key)
                     if comparisons:
+                        valid_fact_ids = set(r[0] for r in conn.execute("SELECT id FROM facts WHERE workspace_id = ?", (session_id,)).fetchall())
                         for c in comparisons:
+                            fa_id = c.fact_a.id if (c.fact_a and c.fact_a.id in valid_fact_ids) else None
+                            fb_id = c.fact_b.id if (c.fact_b and c.fact_b.id in valid_fact_ids) else None
                             conn.execute("""
                                 INSERT OR REPLACE INTO fact_relationships (
                                     id, workspace_id, fact_a_id, fact_b_id, relationship, title,
@@ -540,8 +572,7 @@ class SessionManager:
                                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """, (
                                 c.id, session_id,
-                                c.fact_a.id if c.fact_a else None,
-                                c.fact_b.id if c.fact_b else None,
+                                fa_id, fb_id,
                                 c.relationship_type.value, c.title, c.explanation,
                                 c.reconciliation_factor, 1.0
                             ))
@@ -644,6 +675,15 @@ class SessionManager:
             conn = self._get_conn()
             try:
                 with conn:
+                    ws_row = conn.execute("SELECT id FROM workspaces WHERE id = ?", (session_id,)).fetchone()
+                    if not ws_row:
+                        now_ts = datetime.now().isoformat()
+                        session = self.get_session(session_id)
+                        ws_title = session.title if session else "Active Workspace"
+                        conn.execute(
+                            "INSERT OR REPLACE INTO workspaces (id, title, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                            (session_id, ws_title, "", now_ts, now_ts)
+                        )
                     conn.execute(
                         "INSERT OR REPLACE INTO messages (id, workspace_id, role, content, citations, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
                         (msg.id, session_id, msg.role, msg.content, citations_json, msg.timestamp)
@@ -680,10 +720,20 @@ class SessionManager:
             conn = self._get_conn()
             try:
                 with conn:
+                    # 0. Guarantee workspace exists
+                    ws_row = conn.execute("SELECT id FROM workspaces WHERE id = ?", (session_id,)).fetchone()
+                    if not ws_row:
+                        now_ts = datetime.now().isoformat()
+                        session = self.get_session(session_id)
+                        ws_title = session.title if session else "Active Workspace"
+                        conn.execute(
+                            "INSERT OR REPLACE INTO workspaces (id, title, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                            (session_id, ws_title, "", now_ts, now_ts)
+                        )
+
                     # Map valid document IDs for this workspace
                     doc_rows = conn.execute("SELECT id, filename FROM documents WHERE workspace_id = ?", (session_id,)).fetchall()
                     valid_doc_map = {r["filename"]: r["id"] for r in doc_rows}
-                    default_doc_id = doc_rows[0]["id"] if doc_rows else None
 
                     # Collect all facts including those embedded in comparisons
                     all_facts_to_save = list(knowledge_layer.facts)
@@ -699,13 +749,18 @@ class SessionManager:
                         fname = f.evidence.document_name if f.evidence else "unknown.pdf"
                         doc_id = valid_doc_map.get(fname)
                         if not doc_id:
-                            # Register document if missing to satisfy foreign key
+                            # Register document properly to satisfy foreign key
                             doc_id = f"doc_{hashlib.md5((session_id + fname).encode()).hexdigest()[:12]}"
-                            title = Path(fname).stem.replace("-", " ").replace("_", " ").title()
-                            conn.execute(
-                                "INSERT OR IGNORE INTO documents (id, workspace_id, filename, title, file_size, storage_path, page_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                                (doc_id, session_id, fname, title, 0, "", 1)
-                            )
+                            now_ts = datetime.now().isoformat()
+                            conn.execute("""
+                                INSERT OR IGNORE INTO documents (
+                                    id, workspace_id, filename, file_size, file_hash, storage_path,
+                                    page_count, uploaded_at, status, summary, tags, blocks_count,
+                                    tables_count, figures_count, processed_time
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (
+                                doc_id, session_id, fname, 0, doc_id, "", 1, now_ts, "Processed", "", "[]", 0, 0, 0, "Just now"
+                            ))
                             valid_doc_map[fname] = doc_id
 
                         conn.execute("""

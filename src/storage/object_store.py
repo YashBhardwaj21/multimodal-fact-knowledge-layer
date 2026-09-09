@@ -383,8 +383,24 @@ class ObjectStore:
         session_dir = self.base_dir / session_id
         deleted = False
         if session_dir.exists():
-            shutil.rmtree(session_dir)
-            deleted = True
+            def _handle_remove_readonly(func, path, exc):
+                import stat
+                try:
+                    os.chmod(path, stat.S_IWRITE)
+                    func(path)
+                except Exception:
+                    pass
+
+            try:
+                shutil.rmtree(session_dir, onerror=_handle_remove_readonly)
+                deleted = True
+            except Exception as e:
+                logger.warning(f"Standard rmtree failed for {session_dir} ({e}). Retrying with ignore_errors...")
+                try:
+                    shutil.rmtree(session_dir, ignore_errors=True)
+                    deleted = True
+                except Exception as e2:
+                    logger.warning(f"Could not purge {session_dir}: {e2}")
 
         if self.minio_client:
             try:

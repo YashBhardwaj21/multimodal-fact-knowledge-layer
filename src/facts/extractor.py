@@ -1,5 +1,6 @@
 """Fact extraction engine with verbatim source evidence grounding."""
 
+import os
 import re
 import json
 from pathlib import Path
@@ -37,7 +38,10 @@ class FactExtractor:
         deterministic_facts = self._extract_deterministic(page)
         facts.extend(deterministic_facts)
 
-        if self.llm.provider_type in ["gemini", "openai", "ollama"] and len(text) > 100:
+        # LLM extraction during ingestion is disabled by default to keep document ingestion fast,
+        # offline, and avoid rate-limiting the provider. Gemini/OpenAI is strictly reserved for Ask Chat (RAG).
+        enable_llm_facts = os.getenv("ENABLE_LLM_FACT_EXTRACTION", "false").lower() == "true"
+        if enable_llm_facts and self.llm.provider_type in ["gemini", "openai", "ollama"] and len(text) > 100:
             try:
                 llm_facts = self._extract_with_llm(page)
                 facts.extend(llm_facts)

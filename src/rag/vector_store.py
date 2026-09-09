@@ -16,12 +16,14 @@ class SessionVectorStore:
         self.chroma_dir = Path(storage_base) / session_id / "chroma"
         self.chroma_dir.mkdir(parents=True, exist_ok=True)
         self.collection = None
+        self.client = None
         self._init_chroma()
 
     def _init_chroma(self):
         try:
             import chromadb
             client = chromadb.PersistentClient(path=str(self.chroma_dir))
+            self.client = client
             self.collection = client.get_or_create_collection(
                 name=f"coll_{self.session_id[:16]}",
                 metadata={"hnsw:space": "cosine"}
@@ -29,6 +31,20 @@ class SessionVectorStore:
         except Exception as e:
             logger.warning(f"ChromaDB initialization fallback for session {self.session_id}: {e}")
             self.collection = None
+            self.client = None
+
+    def close(self):
+        """Release Chroma client handles and open file locks."""
+        self.collection = None
+        if self.client:
+            try:
+                if hasattr(self.client, 'close'):
+                    self.client.close()
+                elif hasattr(self.client, '_system') and hasattr(self.client._system, 'stop'):
+                    self.client._system.stop()
+            except Exception:
+                pass
+            self.client = None
 
     def add_blocks(self, doc_name: str, blocks: List[Dict[str, Any]]):
         """Index text blocks into the session collection."""

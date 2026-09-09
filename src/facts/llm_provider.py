@@ -235,7 +235,7 @@ class LLMProvider:
                 headers={"Content-Type": "application/json"}
             )
             try:
-                with urllib.request.urlopen(req, timeout=45) as resp:
+                with urllib.request.urlopen(req, timeout=90) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                     self.model_name = model
                     return data["candidates"][0]["content"]["parts"][0]["text"]
