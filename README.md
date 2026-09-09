@@ -103,6 +103,8 @@ Quantitative evidence in financial statements and macroeconomic reports is rarel
 
 | Model | Location | Description |
 |---|---|---|
+| `CanonicalEntity` | `src/facts/entity_models.py` | Unique entity identifier, canonical name, entity type, accumulated aliases, and mention history |
+| `EntityMention` | `src/facts/entity_models.py` | Surface mention, normalized form, inferred type, document location, and sentence context |
 | `Fact` | `src/facts/models.py` | Subject, attribute, value, normalized_value, unit, temporal_scope, context_scope, confidence, evidence |
 | `Evidence` | `src/facts/models.py` | Source document name, page number, verbatim_quote, char_offset, table_citation, image_citation |
 | `FactComparison` | `src/facts/models.py` | Relationship type (corroboration, contradiction, reconciled, extraction_failure), paired facts, explanation, reconciliation_factor |
@@ -130,6 +132,33 @@ The engine (`src/reconciliation/engine.py`) normalizes attributes into shared se
 | `contradiction` | Facts sharing the exact same subject, attribute, scope, and time period whose values diverge beyond tolerance. |
 | `reconciled` | Apparent divergences resolved by differing temporal boundaries (e.g., FY23 vs FY24), reporting scopes (e.g., Headline vs. Core CPI, Standalone vs. Consolidated), or estimation stages (Budget Estimate vs. Revised Estimate). |
 | `extraction_failure` | Documents handled edge cases such as parenthetical negative financial accounting notation `(1,234.56)` vs raw values. |
+
+---
+
+## Semantic Entity Resolution Subsystem
+
+The entity resolution subsystem (`src/facts/entity_resolver.py`) implements a domain-agnostic, layered semantic pipeline to resolve arbitrary entity mentions across documents.
+
+### Pipeline Stages
+
+1. **Surface-Form Normalization**: Strips Unicode combining marks, possessive markers, internal abbreviation periods, and standardized legal entity suffixes.
+2. **Context Profiling**: Infers open-ended entity types using contextual definition cues and appositive structures.
+3. **Candidate Generation**: Retrieves candidate entities via normalized inverted indexing, token inverted indexing, initialism lookups, and contextual vector embeddings.
+4. **Multi-Signal Scoring**: Evaluates candidate matches using a weighted combination of token Jaccard overlap, character trigrams, initialism symmetry, contextual embedding cosine similarity, and entity type compatibility.
+5. **Modifier Conflict Guard**: Penalizes candidate pairs containing differing non-suffix substantive noun modifiers to prevent false merges.
+6. **Contextual Divergence Guard**: Flags identical surface forms with divergent contextual embeddings as distinct entities to prevent homonym false merges.
+7. **Adaptive LLM Disambiguation**: Employs prompt-injection-defended structured JSON reranking when candidate scores fall within the review threshold interval.
+8. **Canonical Lifecycle Management**: Dynamically reinforces canonical naming, accumulates aliases, links mentions to canonical entity identifiers, and persists records in SQLite.
+
+### Pluggable Embedding Backends
+
+- **ChromaEmbeddingProvider**: Local ONNX MiniLM vector embeddings matching the document store.
+- **SentenceTransformerEmbeddingProvider**: Local SentenceTransformer model backend.
+- **DeterministicNgramEmbeddingProvider**: Zero-dependency deterministic fallback using character and token n-gram hashing.
+
+### Entity-Grounded Reconciliation
+
+Facts preserve original observed surface forms in `surface_subject` while linking to a shared `canonical_subject` and `entity_id`. Cross-document reconciliation evaluates comparability via canonical identity rather than raw surface equality, propagating uncertainty when resolution confidence falls below threshold.
 
 ---
 

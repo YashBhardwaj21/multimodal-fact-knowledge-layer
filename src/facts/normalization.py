@@ -13,8 +13,8 @@ def derive_document_subject(doc_name: str) -> str:
     stem = Path(doc_name).stem
     # Replace separators with spaces
     cleaned = re.sub(r'[-_.]+', ' ', stem)
-    # Remove generic trailing version numbers or hashes
-    cleaned = re.sub(r'\b(?:v\d+|rev\d+|\d{6,})\b', '', cleaned, flags=re.IGNORECASE)
+    # Remove generic trailing version numbers, edition labels, and fiscal/temporal indicators
+    cleaned = re.sub(r'\b(?:fy\s*\d{2,4}|q[1-4]|h[1-2]|\d{4}|alpha|beta|draft|final|v\d+|rev\d+|\d{6,})\b', '', cleaned, flags=re.IGNORECASE)
     # Remove file extension artifacts
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
     return cleaned.title() or "Document"
@@ -32,13 +32,23 @@ def derive_page_subject(page_text: str, doc_name: str) -> str:
         if len(subj) >= 3 and not any(w in subj.lower() for w in ["page", "chapter", "table"]):
             return subj.title()
 
-    # 2. Look for dominant entity title in the first prominent heading lines
+    # 2. Look for dominant entity title in the first prominent heading lines or leading clause
     first_lines = [l.strip() for l in page_text.split("\n")[:4] if len(l.strip()) >= 3]
     for line in first_lines:
-        if len(line) <= 30 and not line.endswith((".", "?", "!", ",", ";", ":")):
+        # Check if entire line is a clean title
+        if len(line) <= 35 and not line.endswith((".", "?", "!", ",", ";", ":")):
             lower_l = line.lower()
             if not any(w in lower_l for w in ["page", "chapter", "section", "table of contents", "introduction", "study guide", "guide", "click here", "did you know"]):
                 return line.title()
+
+    # Look for leading title clause before period or newline (e.g. "CloudSys Infrastructure Audit FY26. Total...")
+    first_clause = re.split(r'[\n\r.!?]', page_text.strip())[0].strip()
+    if 3 <= len(first_clause) <= 45:
+        lower_c = first_clause.lower()
+        if not any(w in lower_c for w in ["page", "chapter", "section", "table", "http", "click", "welcome"]):
+            cleaned_c = re.sub(r'\b(?:fy\s*\d{2,4}|q[1-4]|h[1-2]|\d{4})\b', '', first_clause, flags=re.IGNORECASE).strip()
+            if len(cleaned_c) >= 3:
+                return cleaned_c.title()
 
     # 3. Check for subject definition sentence at top: "X is a/an ..." or "X was a/an ..."
     m_def = re.search(r'^([A-Z][a-zA-Z\s\'-]{2,30}?)\s+(?:is|was|are|were)\s+(?:a|an|the)\b', page_text.strip())

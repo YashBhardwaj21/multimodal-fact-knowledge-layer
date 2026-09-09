@@ -17,6 +17,7 @@ from typing import List, Dict, Any, Optional, Set
 from src.facts.models import Fact, Evidence
 from src.ingestion.pdf_loader import PDFPage
 from src.facts.llm_provider import LLMProvider
+from src.facts.entity_resolver import EntityResolver
 from src.facts.normalization import (
     derive_document_subject,
     derive_page_subject,
@@ -32,8 +33,13 @@ logger = logging.getLogger(__name__)
 class FactExtractor:
     """Extracts grounded facts from arbitrary PDF documents without domain-specific assumptions."""
 
-    def __init__(self, llm_provider: Optional[LLMProvider] = None):
+    def __init__(
+        self,
+        llm_provider: Optional[LLMProvider] = None,
+        entity_resolver: Optional[EntityResolver] = None
+    ):
         self.llm = llm_provider or LLMProvider()
+        self.entity_resolver = entity_resolver or EntityResolver(llm_provider=self.llm)
         self._llm_consecutive_failures = 0
 
     def extract_from_pages(self, pages: List[PDFPage]) -> List[Fact]:
@@ -475,6 +481,25 @@ class FactExtractor:
                         ),
                         confidence=0.92
                     ))
+
+        # 3. Layered Entity Resolution & Grounding
+        if self.entity_resolver:
+            for f in facts:
+                quote_ctx = f.evidence.verbatim_quote if f.evidence else ""
+                ent, dec = self.entity_resolver.resolve_mention(
+                    surface_form=f.subject,
+                    context_sentence=quote_ctx,
+                    document_name=doc,
+                    page_number=p_num,
+                    heading_context=page_subject
+                )
+                f.surface_subject = f.subject
+                f.entity_id = ent.entity_id
+                f.canonical_subject = ent.canonical_name
+                f.entity_resolution_confidence = dec.confidence
+                f.entity_type = ent.entity_type
+                f.entity_resolution_status = ent.resolution_status
+                f.subject = ent.canonical_name or f.surface_subject
 
         return facts
 

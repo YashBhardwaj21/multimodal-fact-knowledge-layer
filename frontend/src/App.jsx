@@ -1781,6 +1781,31 @@ export default function App() {
                                         {c.fact_a.subject} &bull; {c.fact_a.attribute}: {c.fact_a.value}
                                       </div>
 
+                                      {(c.fact_a.entity || c.fact_a.canonical_subject) && (
+                                        <div style={{ margin: '6px 0', padding: '6px 9px', background: '#f6f4f0', borderRadius: '6px', border: '1px solid #e7e2d9', fontSize: '0.74rem' }}>
+                                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '2px' }}>
+                                            <span style={{ color: 'var(--text-muted)' }}>
+                                              Mention: <strong style={{ color: 'var(--text-title)' }}>{c.fact_a.surface_subject || c.fact_a.subject}</strong>
+                                            </span>
+                                            <span style={{
+                                              padding: '1px 5px',
+                                              borderRadius: '4px',
+                                              fontWeight: 700,
+                                              fontSize: '0.66rem',
+                                              background: (c.fact_a.entity?.resolution_status || 'resolved') === 'resolved' ? '#e6f4ea' : '#fef3c7',
+                                              color: (c.fact_a.entity?.resolution_status || 'resolved') === 'resolved' ? '#137333' : '#b45309'
+                                            }}>
+                                              {(c.fact_a.entity?.resolution_status || 'resolved') === 'resolved' ? 'MATCH' : 'POSSIBLE MATCH'} ({Math.round(((c.fact_a.entity?.confidence ?? c.fact_a.entity_resolution_confidence) || 1.0) * 100)}%)
+                                            </span>
+                                          </div>
+                                          {(c.fact_a.canonical_subject && c.fact_a.canonical_subject !== (c.fact_a.surface_subject || c.fact_a.subject)) && (
+                                            <div style={{ color: 'var(--primary)', fontWeight: 600 }}>
+                                              Resolved Entity: <span>{c.fact_a.canonical_subject}</span>
+                                            </div>
+                                          )}
+                                        </div>
+                                      )}
+
                                       {c.fact_a.evidence?.verbatim_quote && (
                                         <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', fontStyle: 'italic', margin: 0, lineHeight: 1.4 }}>
                                           "{c.fact_a.evidence.verbatim_quote}"
@@ -1821,6 +1846,31 @@ export default function App() {
                                       <div style={{ fontSize: '0.86rem', fontWeight: 700, color: 'var(--primary)', margin: '4px 0' }}>
                                         {c.fact_b.subject} &bull; {c.fact_b.attribute}: {c.fact_b.value}
                                       </div>
+
+                                      {(c.fact_b.entity || c.fact_b.canonical_subject) && (
+                                        <div style={{ margin: '6px 0', padding: '6px 9px', background: '#f6f4f0', borderRadius: '6px', border: '1px solid #e7e2d9', fontSize: '0.74rem' }}>
+                                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '2px' }}>
+                                            <span style={{ color: 'var(--text-muted)' }}>
+                                              Mention: <strong style={{ color: 'var(--text-title)' }}>{c.fact_b.surface_subject || c.fact_b.subject}</strong>
+                                            </span>
+                                            <span style={{
+                                              padding: '1px 5px',
+                                              borderRadius: '4px',
+                                              fontWeight: 700,
+                                              fontSize: '0.66rem',
+                                              background: (c.fact_b.entity?.resolution_status || 'resolved') === 'resolved' ? '#e6f4ea' : '#fef3c7',
+                                              color: (c.fact_b.entity?.resolution_status || 'resolved') === 'resolved' ? '#137333' : '#b45309'
+                                            }}>
+                                              {(c.fact_b.entity?.resolution_status || 'resolved') === 'resolved' ? 'MATCH' : 'POSSIBLE MATCH'} ({Math.round(((c.fact_b.entity?.confidence ?? c.fact_b.entity_resolution_confidence) || 1.0) * 100)}%)
+                                            </span>
+                                          </div>
+                                          {(c.fact_b.canonical_subject && c.fact_b.canonical_subject !== (c.fact_b.surface_subject || c.fact_b.subject)) && (
+                                            <div style={{ color: 'var(--primary)', fontWeight: 600 }}>
+                                              Resolved Entity: <span>{c.fact_b.canonical_subject}</span>
+                                            </div>
+                                          )}
+                                        </div>
+                                      )}
 
                                       {c.fact_b.evidence?.verbatim_quote && (
                                         <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', fontStyle: 'italic', margin: 0, lineHeight: 1.4 }}>

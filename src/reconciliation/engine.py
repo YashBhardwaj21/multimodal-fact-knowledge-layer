@@ -1,24 +1,11 @@
 """Domain-agnostic fact reconciliation and comparability engine.
 
-Evaluates pairs of verified facts across documents and sections using an explicit
-multi-dimensional comparability decision matrix:
-- Entity comparability (MATCH, ALIAS, DIFFERENT, UNKNOWN)
-- Predicate comparability (MATCH, SIMILAR, DIFFERENT)
-- Unit compatibility (COMPATIBLE, INCOMPATIBLE, UNKNOWN)
-- Temporal compatibility (SAME, DIFFERENT, UNKNOWN)
-- Contextual scope compatibility (SAME, DIFFERENT, UNKNOWN)
-- Value comparison (IDENTICAL, WITHIN_TOLERANCE, DIVERGENT)
-
-Resolves four standard assignment outcomes:
-1. CORROBORATION: Independent sources agree on the same metric, time, and scope.
-2. CONTRADICTION: Competing claims for the exact same metric, period, and scope.
-3. RECONCILED: Divergence resolved by differing time, scope, or accounting definitions.
-4. EXTRACTION_FAILURE / UNCERTAIN: Insufficient grounding or unresolvable ambiguity.
 """
 
+import re
 import uuid
 import logging
-from typing import List, Dict, Optional, Set, Tuple
+from typing import List, Dict, Optional, Set, Tuple, Any
 from collections import defaultdict
 from src.facts.models import Fact, FactComparison, RelationshipType, KnowledgeLayer
 from src.facts.normalization import resolve_entity_alias, resolve_predicate_similarity
@@ -32,21 +19,23 @@ class ReconciliationEngine:
     def __init__(self, relative_tolerance: float = 0.05):
         self.tolerance = relative_tolerance
 
-    def reconcile(self, facts: List[Fact], documents: List[str] = None) -> KnowledgeLayer:
+    def reconcile(
+        self,
+        facts: List[Fact],
+        documents: Optional[List[str]] = None,
+        entities: Optional[Dict[str, Any]] = None
+    ) -> KnowledgeLayer:
         """Reconcile facts dynamically across documents."""
         docs = documents or sorted(list(set(f.evidence.document_name for f in facts if f.evidence)))
+        pairs = self._generate_candidate_pairs(facts)
         comparisons: List[FactComparison] = []
 
-        # 1. Cluster candidate facts by broad conceptual predicate similarity
-        candidate_pairs = self._generate_candidate_pairs(facts)
-
-        # 2. Evaluate each pair through the comparability decision matrix
-        for f_a, f_b in candidate_pairs:
+        for f_a, f_b in pairs:
             comp = self._evaluate_pairwise_comparability(f_a, f_b)
             if comp:
                 comparisons.append(comp)
 
-        # 3. Deduplicate comparisons
+        # Deduplicate comparisons with matching fact pairs and relationship
         seen_keys: Set[tuple] = set()
         deduped: List[FactComparison] = []
         for c in comparisons:
@@ -60,9 +49,11 @@ class ReconciliationEngine:
                 seen_keys.add(pair_key)
                 deduped.append(c)
 
+        ent_dict = entities or {}
         stats = {
             "total_facts": len(facts),
             "total_documents": len(docs),
+            "total_entities": len(ent_dict),
             "corroborations": sum(1 for c in deduped if c.relationship_type == RelationshipType.CORROBORATION),
             "contradictions": sum(1 for c in deduped if c.relationship_type == RelationshipType.CONTRADICTION),
             "reconciled": sum(1 for c in deduped if c.relationship_type == RelationshipType.RECONCILED),
@@ -73,31 +64,44 @@ class ReconciliationEngine:
             documents=docs,
             facts=facts,
             comparisons=deduped,
+            entities=ent_dict,
             statistics=stats
         )
 
     def _generate_candidate_pairs(self, facts: List[Fact]) -> List[Tuple[Fact, Fact]]:
-        """Identify candidate pairs sharing predicate or semantic affinity."""
+        """Identify candidate pairs sharing canonical entity identity, predicate, or semantic affinity."""
         pairs = []
         n = len(facts)
         if n < 2:
             return pairs
 
-        # Group facts by loose predicate key to prevent quadratic explosion on large corpora
+        if n <= 50:
+            for i in range(n):
+                for j in range(i + 1, n):
+                    pairs.append((facts[i], facts[j]))
+            return pairs
+
         clusters = defaultdict(list)
+        pred_stop = {
+            "consolidated", "standalone", "domestic", "international", "total", "overall",
+            "annual", "quarterly", "fiscal", "monthly", "weekly", "yearly", "reported",
+            "gross", "net", "adjusted", "core"
+        }
         for f in facts:
+            if f.entity_id:
+                clusters[f"entity_{f.entity_id}"].append(f)
+
             stem = f.attribute.lower()
-            # Extract key nouns/words, ignoring generic scope and filler words
-            words = [w for w in stem.split() if len(w) > 3 and w not in ["consolidated", "standalone", "domestic", "international", "total", "overall"]]
+            words = [w for w in re.findall(r'\b[a-zA-Z]{3,}\b', stem) if w not in pred_stop]
             cluster_key = words[0] if words else stem[:10]
-            clusters[cluster_key].append(f)
+            clusters[f"pred_{cluster_key}"].append(f)
 
         seen_pairs: Set[tuple] = set()
 
         for key, cluster_facts in clusters.items():
             k_len = len(cluster_facts)
-            for i in range(min(k_len, 12)):
-                for j in range(i + 1, min(k_len, 12)):
+            for i in range(min(k_len, 25)):
+                for j in range(i + 1, min(k_len, 25)):
                     f1 = cluster_facts[i]
                     f2 = cluster_facts[j]
                     pair_id = tuple(sorted([f1.id, f2.id]))
@@ -109,15 +113,32 @@ class ReconciliationEngine:
 
     def _evaluate_pairwise_comparability(self, f_a: Fact, f_b: Fact) -> Optional[FactComparison]:
         """Construct explicit multi-dimensional comparability decision matrix."""
-        # 1. Entity comparability
-        entity_match = resolve_entity_alias(f_a.subject, f_b.subject)
+        # Entity comparability
+        if f_a.entity_id and f_b.entity_id:
+            if f_a.entity_id == f_b.entity_id:
+                if (
+                    f_a.entity_resolution_status == "ambiguous"
+                    or f_b.entity_resolution_status == "ambiguous"
+                    or f_a.entity_resolution_confidence < 0.75
+                    or f_b.entity_resolution_confidence < 0.75
+                ):
+                    entity_match = "POSSIBLE_MATCH"
+                else:
+                    entity_match = "MATCH"
+            else:
+                entity_match = "DIFFERENT"
+        else:
+            entity_match = resolve_entity_alias(f_a.subject, f_b.subject)
 
-        # 2. Predicate comparability
+        if entity_match == "DIFFERENT":
+            return None
+
+        # Predicate comparability
         pred_match = resolve_predicate_similarity(f_a.attribute, f_b.attribute)
         if pred_match == "DIFFERENT":
-            return None  # Facts refer to unrelated predicates
+            return None
 
-        # 3. Unit compatibility
+        # Unit compatibility
         unit_a = (f_a.unit or "").strip().upper()
         unit_b = (f_b.unit or "").strip().upper()
         if not unit_a or not unit_b:
@@ -127,7 +148,7 @@ class ReconciliationEngine:
         else:
             unit_match = "INCOMPATIBLE"
 
-        # 4. Temporal compatibility
+        # Temporal compatibility
         time_a = f_a.temporal_scope
         time_b = f_b.temporal_scope
         if not time_a or not time_b:
@@ -137,7 +158,7 @@ class ReconciliationEngine:
         else:
             time_match = "DIFFERENT"
 
-        # 5. Contextual Scope compatibility
+        # Contextual scope compatibility
         scope_a = f_a.context_scope
         scope_b = f_b.context_scope
         if not scope_a or not scope_b:
@@ -147,12 +168,11 @@ class ReconciliationEngine:
         else:
             scope_match = "DIFFERENT"
 
-        # 6. Numeric Value Comparison
+        # Numeric value comparison
         val_a = f_a.normalized_value
         val_b = f_b.normalized_value
 
         if val_a is None or val_b is None:
-            # Non-numeric comparison or failure to normalize
             if unit_match == "INCOMPATIBLE":
                 return FactComparison(
                     id=f"comp_{uuid.uuid4().hex[:8]}",
@@ -170,7 +190,6 @@ class ReconciliationEngine:
                 )
             return None
 
-        # Calculate relative delta
         denom = max(abs(val_a), abs(val_b))
         rel_diff = abs(val_a - val_b) / denom if denom > 0 else 0.0
 
@@ -184,26 +203,35 @@ class ReconciliationEngine:
         page_a = f_a.evidence.page_number if f_a.evidence else 0
         page_b = f_b.evidence.page_number if f_b.evidence else 0
 
-        # Skip trivial identical intra-page duplicate citations
+        # Skip intra-page identical duplicate citations
         if doc_a == doc_b and page_a == page_b and f_a.value == f_b.value:
             return None
 
+        def _format_entity_label(f: Fact) -> str:
+            if f.surface_subject and f.canonical_subject and f.surface_subject != f.canonical_subject:
+                return f"'{f.surface_subject}' (canonical: '{f.canonical_subject}')"
+            return f"'{f.subject}'"
+
+        ent_desc_a = _format_entity_label(f_a)
+        ent_desc_b = _format_entity_label(f_b)
+
         matrix_repr = (
             f"Comparability Decision Matrix:\n"
-            f"• Entity: {entity_match} ('{f_a.subject}' vs '{f_b.subject}')\n"
-            f"• Predicate: {pred_match} ('{f_a.attribute}' vs '{f_b.attribute}')\n"
-            f"• Unit: {unit_match} ('{unit_a}' vs '{unit_b}')\n"
-            f"• Temporal Scope: {time_match} ('{time_a}' vs '{time_b}')\n"
-            f"• Context Scope: {scope_match} ('{scope_a}' vs '{scope_b}')\n"
-            f"• Value Relation: {val_relation} (Δ = {rel_diff * 100:.2f}%)"
+            f"- Entity: {entity_match} ({ent_desc_a} vs {ent_desc_b})\n"
+            f"- Predicate: {pred_match} ('{f_a.attribute}' vs '{f_b.attribute}')\n"
+            f"- Unit: {unit_match} ('{unit_a}' vs '{unit_b}')\n"
+            f"- Temporal Scope: {time_match} ('{time_a}' vs '{time_b}')\n"
+            f"- Context Scope: {scope_match} ('{scope_a}' vs '{scope_b}')\n"
+            f"- Value Relation: {val_relation} (delta = {rel_diff * 100:.2f}%)"
         )
 
-        # CASE 1: CORROBORATION
-        # Same metric, matching entity, matching scope & time, values agree within tolerance
+        # Corroboration
         if val_relation == "WITHIN_TOLERANCE" and unit_match in ["COMPATIBLE", "UNKNOWN"]:
             time_str = f" ({time_a})" if time_a else ""
             is_cross = (doc_a != doc_b)
             prefix = "Cross-Document Corroboration" if is_cross else "Consistency Confirmation"
+            if entity_match == "POSSIBLE_MATCH":
+                prefix = f"Possible {prefix}"
             return FactComparison(
                 id=f"comp_{uuid.uuid4().hex[:8]}",
                 relationship_type=RelationshipType.CORROBORATION,
@@ -212,16 +240,19 @@ class ReconciliationEngine:
                 fact_b=f_b,
                 explanation=(
                     f"Sources independently corroborate '{f_a.attribute}'.\n"
-                    f"Source A ({doc_a}, p.{page_a}): '{f_a.value}'\n"
-                    f"Source B ({doc_b}, p.{page_b}): '{f_b.value}'\n"
+                    f"Source A ({doc_a}, p.{page_a}): '{f_a.value}' (Entity: {ent_desc_a})\n"
+                    f"Source B ({doc_b}, p.{page_b}): '{f_b.value}' (Entity: {ent_desc_b})\n"
                     f"Delta is {rel_diff * 100:.2f}%, within tolerance threshold ({self.tolerance * 100:.1f}%).\n\n"
                     f"{matrix_repr}"
                 ),
-                reconciliation_factor="Numerical agreement within configured tolerance across verified source citations."
+                reconciliation_factor=(
+                    "Numerical agreement within configured tolerance across verified source citations."
+                    if entity_match == "MATCH"
+                    else "Possible agreement subject to uncertain entity identity match."
+                )
             )
 
-        # CASE 2: RECONCILED BY TEMPORAL EVOLUTION
-        # Divergence explained by differing reporting periods
+        # Reconciled by temporal evolution
         if time_match == "DIFFERENT":
             return FactComparison(
                 id=f"comp_{uuid.uuid4().hex[:8]}",
@@ -237,8 +268,7 @@ class ReconciliationEngine:
                 reconciliation_factor=f"Temporal period evolution: '{time_a}' -> '{time_b}'"
             )
 
-        # CASE 3: RECONCILED BY REPORTING SCOPE / METHODOLOGY
-        # Divergence explained by differing scope (e.g. Consolidated vs Standalone, Domestic vs Global)
+        # Reconciled by reporting scope
         if scope_match == "DIFFERENT":
             return FactComparison(
                 id=f"comp_{uuid.uuid4().hex[:8]}",
@@ -254,12 +284,13 @@ class ReconciliationEngine:
                 reconciliation_factor=f"Context boundary differentiation: '{scope_a}' vs '{scope_b}'"
             )
 
-        # CASE 4: CONTRADICTION
-        # Same period, same scope, same entity & predicate, but values diverge significantly
+        # Contradiction
         if (time_match in ["SAME", "UNKNOWN"]) and (scope_match in ["SAME", "UNKNOWN"]) and val_relation == "DIVERGENT":
             if unit_match in ["COMPATIBLE", "UNKNOWN"]:
                 is_cross = (doc_a != doc_b)
                 prefix = "Cross-Document Contradiction" if is_cross else "Internal Discrepancy"
+                if entity_match == "POSSIBLE_MATCH":
+                    prefix = f"Potential {prefix}"
                 return FactComparison(
                     id=f"comp_{uuid.uuid4().hex[:8]}",
                     relationship_type=RelationshipType.CONTRADICTION,
@@ -268,17 +299,21 @@ class ReconciliationEngine:
                     fact_b=f_b,
                     explanation=(
                         f"Direct contradiction detected for '{f_a.attribute}'.\n"
-                        f"Source A ({doc_a}, p.{page_a}) claims '{f_a.value}', whereas "
-                        f"Source B ({doc_b}, p.{page_b}) claims '{f_b.value}'.\n"
+                        f"Source A ({doc_a}, p.{page_a}) claims '{f_a.value}' (Entity: {ent_desc_a}), whereas "
+                        f"Source B ({doc_b}, p.{page_b}) claims '{f_b.value}' (Entity: {ent_desc_b}).\n"
                         f"Both claims share the same temporal scope ('{time_a or 'unspecified'}') "
                         f"and context scope ('{scope_a or 'unspecified'}'), yielding an irreconcilable difference "
                         f"of {rel_diff * 100:.2f}%.\n\n"
                         f"{matrix_repr}"
                     ),
-                    reconciliation_factor="Unreconciled contradiction: competing values reported for identical scope and period."
+                    reconciliation_factor=(
+                        "Unreconciled contradiction: competing values reported for identical scope and period."
+                        if entity_match == "MATCH"
+                        else "Potential contradiction subject to uncertain entity identity match."
+                    )
                 )
 
-        # CASE 5: EXTRACTION_FAILURE / UNCERTAIN
+        # Extraction failure or uncertain comparison
         return FactComparison(
             id=f"comp_{uuid.uuid4().hex[:8]}",
             relationship_type=RelationshipType.EXTRACTION_FAILURE,

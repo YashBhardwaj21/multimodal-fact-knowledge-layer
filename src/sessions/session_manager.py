@@ -13,6 +13,7 @@ import logging
 
 from src.storage.object_store import ObjectStore, default_object_store
 from src.facts.models import KnowledgeLayer, Fact, Evidence, FactComparison, RelationshipType
+from src.facts.entity_models import CanonicalEntity, EntityMention
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +103,13 @@ def _fact_from_dict(d: Dict[str, Any]) -> Fact:
         temporal_scope=d.get("temporal_scope", d.get("time")),
         context_scope=d.get("context_scope", d.get("scope")),
         evidence=ev,
-        confidence=d.get("confidence", 1.0)
+        confidence=d.get("confidence", 1.0),
+        surface_subject=d.get("surface_subject", d.get("subject", "")),
+        entity_id=d.get("entity_id"),
+        canonical_subject=d.get("canonical_subject", d.get("subject", "")),
+        entity_resolution_confidence=d.get("entity_resolution_confidence", 1.0),
+        entity_type=d.get("entity_type", "unknown"),
+        entity_resolution_status=d.get("entity_resolution_status", "resolved" if d.get("entity_id") else "unresolved")
     )
 
 
@@ -252,7 +259,50 @@ class SessionManager:
                             timestamp TEXT NOT NULL,
                             FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
                         );
+
+                        CREATE TABLE IF NOT EXISTS entities (
+                            id TEXT PRIMARY KEY,
+                            workspace_id TEXT NOT NULL,
+                            canonical_name TEXT NOT NULL,
+                            entity_type TEXT DEFAULT 'unknown',
+                            aliases TEXT DEFAULT '[]',
+                            description TEXT DEFAULT '',
+                            confidence REAL DEFAULT 1.0,
+                            resolution_status TEXT DEFAULT 'resolved',
+                            source_documents TEXT DEFAULT '[]',
+                            FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+                        );
+
+                        CREATE TABLE IF NOT EXISTS entity_mentions (
+                            id TEXT PRIMARY KEY,
+                            entity_id TEXT,
+                            workspace_id TEXT NOT NULL,
+                            surface_form TEXT NOT NULL,
+                            normalized_form TEXT NOT NULL,
+                            entity_type TEXT DEFAULT 'unknown',
+                            document_name TEXT NOT NULL,
+                            page_number INTEGER NOT NULL,
+                            context_sentence TEXT DEFAULT '',
+                            confidence REAL DEFAULT 1.0,
+                            resolution_method TEXT DEFAULT 'deterministic',
+                            FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE,
+                            FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+                        );
                     """)
+
+                    # Column migrations for facts table
+                    for col, col_type in [
+                        ("surface_subject", "TEXT DEFAULT ''"),
+                        ("entity_id", "TEXT DEFAULT ''"),
+                        ("canonical_subject", "TEXT DEFAULT ''"),
+                        ("entity_resolution_confidence", "REAL DEFAULT 1.0"),
+                        ("entity_type", "TEXT DEFAULT ''"),
+                        ("entity_resolution_status", "TEXT DEFAULT ''"),
+                    ]:
+                        try:
+                            conn.execute(f"ALTER TABLE facts ADD COLUMN {col} {col_type};")
+                        except sqlite3.OperationalError:
+                            pass
             finally:
                 conn.close()
 
@@ -302,6 +352,7 @@ class SessionManager:
                     # 3. Load facts with evidence
                     facts_cursor = conn.execute("""
                         SELECT f.id, f.document_id, f.subject, f.predicate, f.value, f.normalized_value, f.unit, f.time, f.scope, f.confidence,
+                               f.surface_subject, f.entity_id, f.canonical_subject, f.entity_resolution_confidence, f.entity_type, f.entity_resolution_status,
                                e.document_name, e.page_number, e.quote, e.table_citation, e.image_citation
                         FROM facts f
                         LEFT JOIN evidence e ON f.id = e.fact_id
@@ -329,7 +380,13 @@ class SessionManager:
                             temporal_scope=f_row["time"],
                             context_scope=f_row["scope"],
                             evidence=ev,
-                            confidence=f_row["confidence"] or 1.0
+                            confidence=f_row["confidence"] or 1.0,
+                            surface_subject=f_row["surface_subject"] or f_row["subject"],
+                            entity_id=f_row["entity_id"] or None,
+                            canonical_subject=f_row["canonical_subject"] or f_row["subject"],
+                            entity_resolution_confidence=float(f_row["entity_resolution_confidence"] or 1.0),
+                            entity_type=f_row["entity_type"] or "unknown",
+                            entity_resolution_status=f_row["entity_resolution_status"] or None
                         )
                         facts_map[fact.id] = fact
 
@@ -357,6 +414,54 @@ class SessionManager:
                             reconciliation_factor=r_row["reconciliation_factor"]
                         ))
                     session.knowledge_layer.comparisons = comparisons
+
+                    # 5. Load canonical entities and mentions
+                    ent_cursor = conn.execute(
+                        "SELECT id, canonical_name, entity_type, aliases, description, confidence, resolution_status, source_documents FROM entities WHERE workspace_id = ?",
+                        (row["id"],)
+                    )
+                    entities_map: Dict[str, CanonicalEntity] = {}
+                    for e_row in ent_cursor.fetchall():
+                        try:
+                            aliases = json.loads(e_row["aliases"])
+                        except Exception:
+                            aliases = []
+                        try:
+                            sdocs = json.loads(e_row["source_documents"])
+                        except Exception:
+                            sdocs = []
+                        entities_map[e_row["id"]] = CanonicalEntity(
+                            entity_id=e_row["id"],
+                            canonical_name=e_row["canonical_name"],
+                            entity_type=e_row["entity_type"] or "unknown",
+                            aliases=aliases,
+                            description=e_row["description"] or "",
+                            confidence=float(e_row["confidence"] or 1.0),
+                            resolution_status=e_row["resolution_status"] or "resolved",
+                            source_documents=sdocs
+                        )
+
+                    men_cursor = conn.execute(
+                        "SELECT id, entity_id, surface_form, normalized_form, entity_type, document_name, page_number, context_sentence, confidence, resolution_method FROM entity_mentions WHERE workspace_id = ?",
+                        (row["id"],)
+                    )
+                    for m_row in men_cursor.fetchall():
+                        men_obj = EntityMention(
+                            mention_id=m_row["id"],
+                            surface_form=m_row["surface_form"],
+                            normalized_form=m_row["normalized_form"],
+                            entity_type=m_row["entity_type"] or "unknown",
+                            document_name=m_row["document_name"] or "",
+                            page_number=m_row["page_number"] or 1,
+                            context_sentence=m_row["context_sentence"] or "",
+                            resolved_entity_id=m_row["entity_id"],
+                            confidence=float(m_row["confidence"] or 1.0),
+                            resolution_method=m_row["resolution_method"] or "deterministic"
+                        )
+                        if m_row["entity_id"] in entities_map:
+                            entities_map[m_row["entity_id"]].source_mentions.append(men_obj)
+
+                    session.knowledge_layer.entities = entities_map
 
                     # 5. Load messages
                     msg_cursor = conn.execute(
@@ -542,11 +647,16 @@ class SessionManager:
                             conn.execute("""
                                 INSERT OR REPLACE INTO facts (
                                     id, document_id, workspace_id, subject, predicate, value,
-                                    normalized_value, unit, time, scope, confidence
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    normalized_value, unit, time, scope, confidence,
+                                    surface_subject, entity_id, canonical_subject,
+                                    entity_resolution_confidence, entity_type, entity_resolution_status
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """, (
                                 f.id, doc_id, session_id, f.subject, f.attribute, f.value,
-                                f.normalized_value, f.unit, f.temporal_scope or "", f.context_scope or "", f.confidence
+                                f.normalized_value, f.unit, f.temporal_scope or "", f.context_scope or "", f.confidence,
+                                f.surface_subject or f.subject, f.entity_id or "", f.canonical_subject or f.subject,
+                                float(f.entity_resolution_confidence if f.entity_resolution_confidence is not None else 1.0),
+                                f.entity_type or "unknown", f.entity_resolution_status or ""
                             ))
                             if f.evidence:
                                 ev_id = f"ev_{f.id}"
@@ -766,11 +876,16 @@ class SessionManager:
                         conn.execute("""
                             INSERT OR REPLACE INTO facts (
                                 id, document_id, workspace_id, subject, predicate, value,
-                                normalized_value, unit, time, scope, confidence
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                normalized_value, unit, time, scope, confidence,
+                                surface_subject, entity_id, canonical_subject,
+                                entity_resolution_confidence, entity_type, entity_resolution_status
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """, (
                             f.id, doc_id, session_id, f.subject, f.attribute, f.value,
-                            f.normalized_value, f.unit, f.temporal_scope or "", f.context_scope or "", f.confidence
+                            f.normalized_value, f.unit, f.temporal_scope or "", f.context_scope or "", f.confidence,
+                            f.surface_subject or f.subject, f.entity_id or "", f.canonical_subject or f.subject,
+                            float(f.entity_resolution_confidence if f.entity_resolution_confidence is not None else 1.0),
+                            f.entity_type or "unknown", f.entity_resolution_status or ""
                         ))
                         saved_fact_ids.add(f.id)
 
@@ -798,9 +913,111 @@ class SessionManager:
                             c.relationship_type.value, c.title, c.explanation,
                             c.reconciliation_factor, 1.0
                         ))
+
+                    # Persist canonical entities and mentions if present
+                    if knowledge_layer.entities:
+                        ent_list = list(knowledge_layer.entities.values()) if isinstance(knowledge_layer.entities, dict) else list(knowledge_layer.entities)
+                        for ent in ent_list:
+                            eid = getattr(ent, "entity_id", ent.get("entity_id") if isinstance(ent, dict) else str(uuid.uuid4()))
+                            cname = getattr(ent, "canonical_name", ent.get("canonical_name") if isinstance(ent, dict) else "")
+                            etype = getattr(ent, "entity_type", ent.get("entity_type", "unknown") if isinstance(ent, dict) else "unknown")
+                            aliases = getattr(ent, "aliases", ent.get("aliases", []) if isinstance(ent, dict) else [])
+                            desc = getattr(ent, "description", ent.get("description", "") if isinstance(ent, dict) else "")
+                            conf = getattr(ent, "confidence", ent.get("confidence", 1.0) if isinstance(ent, dict) else 1.0)
+                            status = getattr(ent, "resolution_status", ent.get("resolution_status", "resolved") if isinstance(ent, dict) else "resolved")
+                            sdocs = getattr(ent, "source_documents", ent.get("source_documents", []) if isinstance(ent, dict) else [])
+
+                            conn.execute("""
+                                INSERT OR REPLACE INTO entities (
+                                    id, workspace_id, canonical_name, entity_type, aliases, description,
+                                    confidence, resolution_status, source_documents
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (
+                                eid, session_id, cname, etype, json.dumps(aliases), desc,
+                                float(conf), str(status), json.dumps(sdocs)
+                            ))
+
+                            mentions = getattr(ent, "source_mentions", ent.get("source_mentions", []) if isinstance(ent, dict) else [])
+                            for m in mentions:
+                                mid = getattr(m, "mention_id", m.get("mention_id") if isinstance(m, dict) else str(uuid.uuid4()))
+                                sform = getattr(m, "surface_form", m.get("surface_form", "") if isinstance(m, dict) else "")
+                                nform = getattr(m, "normalized_form", m.get("normalized_form", "") if isinstance(m, dict) else "")
+                                m_etype = getattr(m, "entity_type", m.get("entity_type", "unknown") if isinstance(m, dict) else "unknown")
+                                dname = getattr(m, "document_name", m.get("document_name", "") if isinstance(m, dict) else "")
+                                pnum = getattr(m, "page_number", m.get("page_number", 1) if isinstance(m, dict) else 1)
+                                ctx = getattr(m, "context_sentence", m.get("context_sentence", "") if isinstance(m, dict) else "")
+                                mconf = getattr(m, "confidence", m.get("confidence", 1.0) if isinstance(m, dict) else 1.0)
+                                method = getattr(m, "resolution_method", m.get("resolution_method", "deterministic") if isinstance(m, dict) else "deterministic")
+
+                                conn.execute("""
+                                    INSERT OR REPLACE INTO entity_mentions (
+                                        id, entity_id, workspace_id, surface_form, normalized_form,
+                                        entity_type, document_name, page_number, context_sentence,
+                                        confidence, resolution_method
+                                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """, (
+                                    mid, eid, session_id, sform, nform,
+                                    m_etype, dname, pnum, ctx,
+                                    float(mconf), str(method)
+                                ))
+
                     conn.execute("UPDATE workspaces SET updated_at = ? WHERE id = ?", (datetime.now().isoformat(), session_id))
 
                 session.knowledge_layer = knowledge_layer
+            finally:
+                conn.close()
+
+    def save_entities(self, session_id: str, entities: List[Any]):
+        """Persist canonical entities and mentions into SQLite."""
+        if not entities:
+            return
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                with conn:
+                    for ent in entities:
+                        eid = getattr(ent, "entity_id", ent.get("entity_id") if isinstance(ent, dict) else str(uuid.uuid4()))
+                        cname = getattr(ent, "canonical_name", ent.get("canonical_name") if isinstance(ent, dict) else "")
+                        etype = getattr(ent, "entity_type", ent.get("entity_type", "unknown") if isinstance(ent, dict) else "unknown")
+                        aliases = getattr(ent, "aliases", ent.get("aliases", []) if isinstance(ent, dict) else [])
+                        desc = getattr(ent, "description", ent.get("description", "") if isinstance(ent, dict) else "")
+                        conf = getattr(ent, "confidence", ent.get("confidence", 1.0) if isinstance(ent, dict) else 1.0)
+                        status = getattr(ent, "resolution_status", ent.get("resolution_status", "resolved") if isinstance(ent, dict) else "resolved")
+                        sdocs = getattr(ent, "source_documents", ent.get("source_documents", []) if isinstance(ent, dict) else [])
+
+                        conn.execute("""
+                            INSERT OR REPLACE INTO entities (
+                                id, workspace_id, canonical_name, entity_type, aliases, description,
+                                confidence, resolution_status, source_documents
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            eid, session_id, cname, etype, json.dumps(aliases), desc,
+                            float(conf), str(status), json.dumps(sdocs)
+                        ))
+
+                        mentions = getattr(ent, "source_mentions", ent.get("source_mentions", []) if isinstance(ent, dict) else [])
+                        for m in mentions:
+                            mid = getattr(m, "mention_id", m.get("mention_id") if isinstance(m, dict) else str(uuid.uuid4()))
+                            sform = getattr(m, "surface_form", m.get("surface_form", "") if isinstance(m, dict) else "")
+                            nform = getattr(m, "normalized_form", m.get("normalized_form", "") if isinstance(m, dict) else "")
+                            m_etype = getattr(m, "entity_type", m.get("entity_type", "unknown") if isinstance(m, dict) else "unknown")
+                            dname = getattr(m, "document_name", m.get("document_name", "") if isinstance(m, dict) else "")
+                            pnum = getattr(m, "page_number", m.get("page_number", 1) if isinstance(m, dict) else 1)
+                            ctx = getattr(m, "context_sentence", m.get("context_sentence", "") if isinstance(m, dict) else "")
+                            mconf = getattr(m, "confidence", m.get("confidence", 1.0) if isinstance(m, dict) else 1.0)
+                            method = getattr(m, "resolution_method", m.get("resolution_method", "deterministic") if isinstance(m, dict) else "deterministic")
+
+                            conn.execute("""
+                                INSERT OR REPLACE INTO entity_mentions (
+                                    id, entity_id, workspace_id, surface_form, normalized_form,
+                                    entity_type, document_name, page_number, context_sentence,
+                                    confidence, resolution_method
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (
+                                mid, eid, session_id, sform, nform,
+                                m_etype, dname, pnum, ctx,
+                                float(mconf), str(method)
+                            ))
             finally:
                 conn.close()
 

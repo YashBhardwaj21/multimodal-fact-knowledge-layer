@@ -197,9 +197,18 @@ def upload_document(session_id: str, file: UploadFile = File(...)):
             SESSION_CANONICAL_DOCS[session_id] = {}
         SESSION_CANONICAL_DOCS[session_id][file.filename] = canonical_doc
 
+        # Transfer resolved canonical entities to session knowledge layer
+        if hasattr(fact_extractor, "entity_resolver") and fact_extractor.entity_resolver:
+            for eid, ent in fact_extractor.entity_resolver.entities.items():
+                session.knowledge_layer.entities[eid] = ent
+
         all_session_facts = session.knowledge_layer.facts + new_facts
         all_session_docs = sorted(list(set([d["filename"] for d in session.documents])))
-        session.knowledge_layer = reconciler.reconcile(all_session_facts, all_session_docs)
+        session.knowledge_layer = reconciler.reconcile(
+            facts=all_session_facts,
+            documents=all_session_docs,
+            entities=session.knowledge_layer.entities
+        )
 
         # Persist document, pages, facts, and relationships into SQLite database
         session_manager.add_document(
@@ -359,7 +368,11 @@ def recompute_reconciliation(session_id: str):
         raise HTTPException(status_code=404, detail="Workspace session not found")
     all_session_facts = session.knowledge_layer.facts
     all_session_docs = sorted(list(set([d["filename"] for d in session.documents])))
-    session.knowledge_layer = reconciler.reconcile(all_session_facts, all_session_docs)
+    session.knowledge_layer = reconciler.reconcile(
+        facts=all_session_facts,
+        documents=all_session_docs,
+        entities=session.knowledge_layer.entities
+    )
     session_manager.save_knowledge_layer(session_id, session.knowledge_layer)
     return {
         "status": "success",
@@ -367,6 +380,28 @@ def recompute_reconciliation(session_id: str):
         "comparisons_count": len(session.knowledge_layer.comparisons),
         "comparisons": [c.to_dict() for c in session.knowledge_layer.comparisons],
         "statistics": session.knowledge_layer.statistics
+    }
+
+
+@app.get("/api/sessions/{session_id}/entities")
+def get_session_entities(session_id: str):
+    """Retrieve all canonical entities, aliases, and mentions for a workspace session."""
+    session = session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Workspace session not found")
+
+    ent_list = []
+    if isinstance(session.knowledge_layer.entities, dict):
+        for e in session.knowledge_layer.entities.values():
+            ent_list.append(e.to_dict() if hasattr(e, "to_dict") else e)
+    elif isinstance(session.knowledge_layer.entities, list):
+        for e in session.knowledge_layer.entities:
+            ent_list.append(e.to_dict() if hasattr(e, "to_dict") else e)
+
+    return {
+        "workspace_id": session_id,
+        "total_entities": len(ent_list),
+        "entities": ent_list
     }
 
 
@@ -466,7 +501,11 @@ def reprocess_session_documents(session_id: str):
         processed.append({"filename": fname, "figures": len(figures), "tables": len(canonical_doc.tables), "facts": len(new_facts)})
 
     all_session_docs = sorted(list(set([d["filename"] for d in session.documents])))
-    session.knowledge_layer = reconciler.reconcile(session.knowledge_layer.facts, all_session_docs)
+    session.knowledge_layer = reconciler.reconcile(
+        facts=session.knowledge_layer.facts,
+        documents=all_session_docs,
+        entities=session.knowledge_layer.entities
+    )
     session_manager.save_knowledge_layer(session_id, session.knowledge_layer)
 
     return {

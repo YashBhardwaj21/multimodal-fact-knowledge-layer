@@ -72,6 +72,10 @@ class LLMProvider:
             return self._call_ollama(prompt, system_prompt, as_json=as_json)
         return ""
 
+    def generate_completion(self, user_prompt: str, system_prompt: Optional[str] = None, temperature: float = 0.2) -> str:
+        """Alias for generate accepting user_prompt and system_prompt."""
+        return self.generate(prompt=user_prompt, system_prompt=system_prompt, temperature=temperature, as_json=False)
+
     def _call_gemini(self, prompt: str, system_prompt: Optional[str], temperature: float, as_json: bool = False) -> str:
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:

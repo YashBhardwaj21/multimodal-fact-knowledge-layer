@@ -103,18 +103,62 @@ class ChatEngine:
                         resolved_doc_name = d_name
                         break
 
-        # 5. Extract relevant facts matching the query or target page
+        # 5. Extract relevant facts, canonical entities, and cross-document comparisons
         relevant_facts = []
+        q_tokens = set(re.findall(r'\b\w{3,}\b', q_strip))
+        is_general_fact_query = any(k in q_strip for k in [
+            "fact", "facts", "metric", "metrics", "number", "numbers", "summary",
+            "summarize", "overview", "data", "statistic", "statistics", "report", "all", "what is", "who is"
+        ])
+
         for f in session.knowledge_layer.facts:
-            match_doc = not document_name or f.evidence.document_name == document_name
-            match_page = not target_page or f.evidence.page_number == target_page
-            text_match = (
-                f.subject.lower() in q_strip or
-                f.attribute.lower() in q_strip or
-                any(w in f.value.lower() for w in q_strip.split() if len(w) > 3)
+            match_doc = not document_name or (f.evidence and f.evidence.document_name == document_name)
+            match_page = not target_page or (f.evidence and f.evidence.page_number == target_page)
+
+            subj_str = (f.subject or "").lower()
+            surf_str = (f.surface_subject or "").lower()
+            canon_str = (f.canonical_subject or "").lower()
+            attr_str = (f.attribute or "").lower()
+            val_str = (f.value or "").lower()
+
+            entity_match = (
+                subj_str in q_strip or (len(subj_str) >= 3 and subj_str in q_tokens) or
+                (surf_str and (surf_str in q_strip or surf_str in q_tokens)) or
+                (canon_str and (canon_str in q_strip or any(tok in canon_str for tok in q_tokens)))
             )
-            if (match_doc and match_page and target_page) or text_match:
+            attr_match = attr_str in q_strip or any(tok in attr_str for tok in q_tokens)
+            val_match = any(tok in val_str for tok in q_tokens)
+
+            if (match_doc and match_page and target_page) or entity_match or attr_match or val_match:
                 relevant_facts.append(f)
+            elif is_general_fact_query and match_doc and len(relevant_facts) < 15:
+                relevant_facts.append(f)
+
+        # Retrieve matched canonical entity profiles
+        matched_entities = []
+        for eid, ent in session.knowledge_layer.entities.items():
+            cname = ent.canonical_name.lower()
+            aliases = [a.lower() for a in ent.aliases]
+            if (
+                cname in q_strip or any(tok in cname for tok in q_tokens) or
+                any(a in q_strip or a in q_tokens for a in aliases)
+            ):
+                matched_entities.append(ent)
+
+        # Retrieve matched reconciliation comparisons
+        matched_comparisons = []
+        is_reconciliation_query = any(k in q_strip for k in [
+            "compare", "comparison", "corroborat", "contradict", "differ", "difference",
+            "discrepan", "reconcil", "conflict", "agree", "versus", "vs", "competing"
+        ])
+        for comp in session.knowledge_layer.comparisons:
+            title_l = comp.title.lower()
+            factor_l = (comp.reconciliation_factor or "").lower()
+            expl_l = comp.explanation.lower()
+            if is_reconciliation_query:
+                matched_comparisons.append(comp)
+            elif any(tok in title_l for tok in q_tokens if len(tok) >= 4):
+                matched_comparisons.append(comp)
 
         # 6. Retrieve relevant visual figures and structured tables
         all_figures = default_object_store.get_figures_meta(session.id, document_name)
@@ -242,6 +286,8 @@ class ChatEngine:
             facts=relevant_facts,
             tables=matched_tables,
             multimodal_images=multimodal_images,
+            entities=matched_entities,
+            comparisons=matched_comparisons,
             target_page=target_page,
             page_text=page_direct_text,
             doc_name=resolved_doc_name
@@ -266,6 +312,8 @@ class ChatEngine:
         facts: List[Any],
         tables: Optional[List[Dict[str, Any]]] = None,
         multimodal_images: Optional[List[Dict[str, Any]]] = None,
+        entities: Optional[List[Any]] = None,
+        comparisons: Optional[List[Any]] = None,
         target_page: Optional[int] = None,
         page_text: str = "",
         doc_name: Optional[str] = None
@@ -273,38 +321,65 @@ class ChatEngine:
         """Synthesize answer using configured LLM (with multimodal vision if available) or intelligent structured extractor."""
         tables = tables or []
         multimodal_images = multimodal_images or []
+        entities = entities or []
+        comparisons = comparisons or []
 
-        if not passages and not facts and not page_text and not tables and not multimodal_images:
+        if not passages and not facts and not page_text and not tables and not multimodal_images and not comparisons and not entities:
             return (
                 f"No verified information regarding '{query}' was found in the documents currently uploaded to this workspace. "
                 "Please verify the document is uploaded or try rephrasing your question."
             )
 
-        # Prepare context blocks
+        # Context preparation
         context_blocks = []
         if page_text and target_page and doc_name:
             context_blocks.append(f"[Full Page Content from {doc_name} Page {target_page}]:\n{page_text}")
-        for p in passages:
-            context_blocks.append(f"[{p['document_name']} Page {p['page_number']} ({p.get('type', 'text')})]: {p['text']}")
-        for f in facts:
-            context_blocks.append(f"[Fact from {f.evidence.document_name}]: {f.subject} - {f.attribute}: {f.value} ({f.context_scope or ''})")
-        for t in tables:
+
+        for ent in entities[:4]:
+            alias_str = f" | Known Aliases: {', '.join(ent.aliases)}" if ent.aliases else ""
+            desc_str = f" | Description: {ent.description}" if ent.description else ""
+            context_blocks.append(f"[Canonical Entity Profile]: {ent.canonical_name} (Type: {ent.entity_type}){alias_str}{desc_str}")
+
+        for comp in comparisons[:4]:
+            context_blocks.append(
+                f"[Cross-Document Reconciliation]: {comp.title} (Outcome: {comp.relationship_type.value.upper()})\n"
+                f"{comp.explanation}\n"
+                f"Reconciliation Factor: {comp.reconciliation_factor}"
+            )
+
+        for f in facts[:15]:
+            doc_info = f"{f.evidence.document_name} p.{f.evidence.page_number}" if f.evidence else "Document"
+            surf_alias = f" (mention: '{f.surface_subject}')" if (f.surface_subject and f.canonical_subject and f.surface_subject != f.canonical_subject) else ""
+            temporal_info = f" [Period: {f.temporal_scope}]" if f.temporal_scope else ""
+            scope_info = f" [Scope: {f.context_scope}]" if f.context_scope else ""
+            unit_info = f" {f.unit}" if f.unit and f.unit not in f.value else ""
+            context_blocks.append(
+                f"[Verified Fact from {doc_info}]: {f.canonical_subject or f.subject}{surf_alias} | "
+                f"Metric: {f.attribute} = {f.value}{unit_info}{temporal_info}{scope_info}"
+            )
+
+        for t in tables[:2]:
             context_blocks.append(f"[Structured Table from Page {t.get('page_number')}]:\n{t.get('markdown', '')}")
-        for img in multimodal_images:
+
+        for img in multimodal_images[:2]:
             context_blocks.append(f"[Attached Visual Figure/Chart on Page {img.get('page_number')}]: {img.get('caption')} (ID: {img.get('figure_id')})")
 
-        # 1. LLM Generation (Gemini with Multimodal Vision, OpenAI, Ollama)
+        for p in passages[:4]:
+            context_blocks.append(f"[{p['document_name']} Page {p['page_number']} ({p.get('type', 'text')})]: {p['text']}")
+
+        # Generative synthesis
         if self.llm.is_active():
             sys_prompt = (
                 "You are an expert Document Intelligence Assistant. Answer the user's question accurately, "
-                "professionally, and strictly based on the provided document excerpts, tables, and images. "
+                "professionally, and strictly based on the provided document excerpts, tables, images, entity profiles, and verified facts. "
                 "If an image of a chart/figure is provided, describe its visual findings, trends, and exact numbers. "
+                "When referencing organizations or entities, use their established canonical identities and cite page numbers. "
                 "Do NOT extrapolate or hallucinate numbers or facts not present in the verified context."
             )
             if multimodal_images and self.llm.provider_type == "gemini":
                 prompt = (
                     f"User Question: {query}\n\n"
-                    f"Verified Document Evidence Context:\n" + "\n---\n".join(context_blocks[:7]) + "\n\n"
+                    f"Verified Document Evidence Context:\n" + "\n---\n".join(context_blocks[:20]) + "\n\n"
                     "INSTRUCTION FOR ATTACHED IMAGE(S):\n"
                     "You have been provided with one or more high-resolution document figures/charts directly attached as image data. "
                     "Analyze the visual content of the attached image(s) thoroughly. Read the exact chart titles, axes, units, legends, "
@@ -325,7 +400,7 @@ class ChatEngine:
             else:
                 prompt = (
                     f"User Question: {query}\n\n"
-                    f"Verified Document Evidence:\n" + "\n---\n".join(context_blocks[:7]) + "\n\n"
+                    f"Verified Document Evidence:\n" + "\n---\n".join(context_blocks[:20]) + "\n\n"
                     "Provide a clear, detailed, and formatted markdown answer directly addressing the user's question:"
                 )
                 try:
@@ -335,7 +410,7 @@ class ChatEngine:
                 except Exception as e:
                     logger.debug(f"LLM generation failed: {e}")
 
-        # 2. Specific Page Summary Extraction
+        # Page summary fallback
         if target_page and (page_text or passages):
             source_doc = doc_name or (passages[0]["document_name"] if passages else "the document")
             text_content = page_text or "\n".join([p["text"] for p in passages if p.get("page_number") == target_page])
@@ -363,7 +438,7 @@ class ChatEngine:
                 f"> *Tip: Add your `GEMINI_API_KEY` in Settings for full generative synthesis and visual chart interpretation.*"
             )
 
-        # 3. Figure / Visual Chart Query Response
+        # Visual figure response
         if multimodal_images:
             top_fig = multimodal_images[0]
             return (
@@ -375,7 +450,7 @@ class ChatEngine:
                 f"> *Grounding Confidence: 95% (Direct Visual Asset)*"
             )
 
-        # 4. Table Response
+        # Table response
         if tables:
             top_tab = tables[0]
             return (
@@ -385,23 +460,55 @@ class ChatEngine:
                 f"> *Grounding Confidence: 98% (Structured Table)*"
             )
 
-        # 5. Direct Fact Answering
-        if facts:
-            primary_fact = facts[0]
-            ans = f"Based on **{primary_fact.evidence.document_name}** (Page {primary_fact.evidence.page_number}):\n\n"
-            ans += f"- **{primary_fact.subject} - {primary_fact.attribute}**: `{primary_fact.value}`"
-            if primary_fact.temporal_scope:
-                ans += f" (*{primary_fact.temporal_scope}*)"
-            if primary_fact.context_scope:
-                ans += f" [{primary_fact.context_scope}]"
-
-            if len(facts) > 1:
-                ans += "\n\n**Related Observations:**\n"
-                for of in facts[1:4]:
-                    ans += f"- **{of.attribute}**: `{of.value}` ({of.evidence.document_name}, p.{of.evidence.page_number})\n"
+        # Reconciliation response
+        is_reconcil_q = any(k in query.lower() for k in [
+            "compare", "comparison", "corroborat", "contradict", "differ", "difference",
+            "discrepan", "reconcil", "conflict", "agree", "versus", "vs"
+        ])
+        if (is_reconcil_q or not facts) and comparisons:
+            top_c = comparisons[0]
+            ans = f"### Cross-Document Reconciliation: {top_c.title}\n\n"
+            ans += f"**Reconciliation Outcome:** `{top_c.relationship_type.value.upper()}`\n\n"
+            ans += f"{top_c.explanation}\n\n"
+            if len(comparisons) > 1:
+                ans += "**Other Identified Discrepancies & Corroborations:**\n"
+                for oc in comparisons[1:4]:
+                    ans += f"- **{oc.title}** ({oc.relationship_type.value.upper()}): {oc.reconciliation_factor}\n"
             return ans
 
-        # 6. Structured Excerpt Synthesis
+        # Fact and entity response
+        if facts:
+            entity_groups: Dict[str, List[Any]] = {}
+            for f in facts[:14]:
+                subj_display = f.canonical_subject or f.subject
+                if f.surface_subject and f.surface_subject != subj_display:
+                    subj_display += f" (as '{f.surface_subject}')"
+                if subj_display not in entity_groups:
+                    entity_groups[subj_display] = []
+                entity_groups[subj_display].append(f)
+
+            ans = "### Verified Facts & Metrics\n\n"
+            for ent_name, ent_facts in entity_groups.items():
+                ans += f"**{ent_name}**:\n"
+                for f in ent_facts:
+                    temporal = f" *({f.temporal_scope})*" if f.temporal_scope else ""
+                    scope = f" [{f.context_scope}]" if f.context_scope else ""
+                    doc_cit = f" ({f.evidence.document_name}, p.{f.evidence.page_number})" if f.evidence else ""
+                    ans += f"- **{f.attribute}**: `{f.value}`{temporal}{scope}{doc_cit}\n"
+                ans += "\n"
+            return ans.strip()
+
+        # Entity profile response
+        if entities:
+            ans = "### Discovered Entities & Canonical Profiles\n\n"
+            for ent in entities[:6]:
+                alias_str = f" | Known Aliases: *{', '.join(ent.aliases)}*" if ent.aliases else ""
+                ans += f"- **{ent.canonical_name}** (`{ent.entity_type}`){alias_str}\n"
+                if ent.contexts:
+                    ans += f"  > *\"{ent.contexts[0][:160]}...\"*\n"
+            return ans.strip()
+
+        # Passage excerpt synthesis
         top_passage = passages[0]
         paragraphs = [p.strip() for p in top_passage["text"].split("\n") if len(p.strip()) > 25]
         if not paragraphs:

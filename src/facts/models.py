@@ -45,11 +45,28 @@ class Fact:
     context_scope: Optional[str] = None
     evidence: Optional[Evidence] = None
     confidence: float = 1.0
+    surface_subject: str = ""
+    entity_id: Optional[str] = None
+    canonical_subject: Optional[str] = None
+    entity_resolution_confidence: float = 1.0
+    entity_type: Optional[str] = None
+    entity_resolution_status: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
         if self.evidence:
             data["evidence"] = self.evidence.to_dict()
+        if not data.get("surface_subject"):
+            data["surface_subject"] = self.subject
+        if not data.get("canonical_subject"):
+            data["canonical_subject"] = self.subject
+        data["entity"] = {
+            "entity_id": self.entity_id,
+            "canonical_name": self.canonical_subject or self.subject,
+            "resolution_status": self.entity_resolution_status or ("resolved" if self.entity_id else "unresolved"),
+            "confidence": round(self.entity_resolution_confidence, 4),
+            "entity_type": self.entity_type or "unknown"
+        } if self.entity_id else None
         return data
 
 
@@ -78,18 +95,29 @@ class FactComparison:
 
 @dataclass
 class KnowledgeLayer:
-    """The aggregate knowledge graph/store of facts and cross-document reconciliations."""
+    """The aggregate knowledge graph/store of facts, entities, and cross-document reconciliations."""
     documents: List[str] = field(default_factory=list)
     facts: List[Fact] = field(default_factory=list)
     comparisons: List[FactComparison] = field(default_factory=list)
+    entities: Dict[str, Any] = field(default_factory=dict)
     statistics: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
+        ent_list = []
+        if isinstance(self.entities, dict):
+            for e in self.entities.values():
+                ent_list.append(e.to_dict() if hasattr(e, "to_dict") else e)
+        elif isinstance(self.entities, list):
+            for e in self.entities:
+                ent_list.append(e.to_dict() if hasattr(e, "to_dict") else e)
+
         return {
             "documents": self.documents,
             "total_facts": len(self.facts),
             "facts": [f.to_dict() for f in self.facts],
             "total_comparisons": len(self.comparisons),
             "comparisons": [c.to_dict() for c in self.comparisons],
+            "total_entities": len(ent_list),
+            "entities": ent_list,
             "statistics": self.statistics
         }
