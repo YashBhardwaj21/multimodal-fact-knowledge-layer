@@ -167,8 +167,14 @@ class ObjectStore:
 
     def get_page_thumbnail_path(self, session_id: str, doc_name: str, page_number: int) -> Optional[Path]:
         """Retrieve path to a rendered page thumbnail."""
-        thumb_path = self.get_thumbnails_dir(session_id) / Path(doc_name).stem / f"page_{page_number}.png"
-        return thumb_path if thumb_path.exists() else None
+        thumb_dir = self.get_thumbnails_dir(session_id)
+        direct_path = thumb_dir / doc_name / f"page_{page_number}.png"
+        if direct_path.exists():
+            return direct_path
+        stem_path = thumb_dir / Path(doc_name).stem / f"page_{page_number}.png"
+        if stem_path.exists():
+            return stem_path
+        return None
 
     def save_figure(self, session_id: str, doc_name: str, fig_id: str, image_bytes: bytes) -> str:
         """Save an extracted chart or figure asset."""
@@ -222,7 +228,7 @@ class ObjectStore:
 
         all_meta = []
         if doc_name:
-            stems = [Path(doc_name).stem]
+            stems = list(dict.fromkeys([doc_name, Path(doc_name).stem]))
         else:
             stems = [d.name for d in figs_dir.iterdir() if d.is_dir()]
 
@@ -257,7 +263,7 @@ class ObjectStore:
 
         all_tables = []
         if doc_name:
-            stems = [Path(doc_name).stem]
+            stems = list(dict.fromkeys([doc_name, Path(doc_name).stem]))
         else:
             stems = [d.name for d in tabs_dir.iterdir() if d.is_dir()]
 

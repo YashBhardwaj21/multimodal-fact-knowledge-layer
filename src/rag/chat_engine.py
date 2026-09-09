@@ -168,6 +168,12 @@ class ChatEngine:
         # Find figures matching user query keywords or target page
         query_words = [w for w in re.findall(r'\b\w+\b', q_strip) if len(w) > 2]
         is_visual_query = any(k in q_strip for k in ["chart", "figure", "fig", "diagram", "image", "plot", "graph", "trend", "exhibit"])
+        stop_words = {
+            "tell", "what", "when", "where", "which", "with", "from", "about", "show", "read",
+            "find", "have", "this", "that", "page", "table", "does", "explain", "give", "help",
+            "much", "many", "there", "were", "been", "will", "would", "could", "should"
+        }
+        fig_query_words = [w for w in query_words if len(w) > 3 and w not in stop_words]
 
         for fig in all_figures:
             fig_p = fig.get("page_number")
@@ -175,7 +181,10 @@ class ChatEngine:
             fig_id_l = fig.get("figure_id", "").lower()
 
             page_match = (target_page and fig_p == target_page)
-            keyword_match = any(w in caption_l or w in fig_id_l for w in query_words)
+            keyword_match = any(
+                re.search(rf"\b{re.escape(w)}\b", caption_l) or re.search(rf"\b{re.escape(w)}\b", fig_id_l)
+                for w in fig_query_words
+            )
             if page_match or keyword_match or (is_visual_query and len(matched_figures) < 2):
                 matched_figures.append(fig)
 
@@ -204,11 +213,17 @@ class ChatEngine:
         # Retrieve relevant tables
         all_tables = default_object_store.get_tables_meta(session.id, document_name)
         matched_tables: List[Dict[str, Any]] = []
+        tab_query_words = [w for w in query_words if len(w) > 3 and w not in stop_words]
         for tab in all_tables:
             tab_p = tab.get("page_number")
             headers_l = " ".join(tab.get("headers", [])).lower()
             md_l = tab.get("markdown", "").lower()
-            if (target_page and tab_p == target_page) or any(w in headers_l or w in md_l for w in query_words if len(w) > 3):
+            page_match = (target_page and tab_p == target_page)
+            keyword_match = any(
+                re.search(rf"\b{re.escape(w)}\b", headers_l) or re.search(rf"\b{re.escape(w)}\b", md_l)
+                for w in tab_query_words
+            )
+            if page_match or keyword_match:
                 matched_tables.append(tab)
                 if len(matched_tables) >= 2:
                     break
@@ -374,7 +389,8 @@ class ChatEngine:
                 "professionally, and strictly based on the provided document excerpts, tables, images, entity profiles, and verified facts. "
                 "If an image of a chart/figure is provided, describe its visual findings, trends, and exact numbers. "
                 "When referencing organizations or entities, use their established canonical identities and cite page numbers. "
-                "Do NOT extrapolate or hallucinate numbers or facts not present in the verified context."
+                "Do NOT extrapolate or hallucinate numbers or facts not present in the verified context. "
+                "OUTPUT REQUIREMENT: Output ONLY the direct, formatted markdown answer for the user. Never include internal reasoning, scratchpad notes, planning steps, or self-evaluation checklists."
             )
             if multimodal_images and self.llm.provider_type == "gemini":
                 prompt = (
@@ -406,7 +422,9 @@ class ChatEngine:
                 try:
                     response = self.llm.generate(prompt, system_prompt=sys_prompt, as_json=False)
                     if response and len(response.strip()) > 10:
-                        return response.strip()
+                        cleaned = response.strip()
+                        cleaned = re.sub(r'(?i)\n*did i (extrapolate|use|cite).*', '', cleaned).strip()
+                        return cleaned
                 except Exception as e:
                     logger.debug(f"LLM generation failed: {e}")
 
@@ -451,7 +469,8 @@ class ChatEngine:
             )
 
         # Table response
-        if tables:
+        is_table_query = any(k in query.lower() for k in ["table", "column", "row", "tabular", "condition", "cause", "resolution"])
+        if tables and (is_table_query or (not facts and not passages and not comparisons)):
             top_tab = tables[0]
             return (
                 f"### Extracted Table on Page {top_tab.get('page_number', 1)}\n\n"

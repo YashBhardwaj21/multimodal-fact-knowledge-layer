@@ -1,11 +1,34 @@
 """LLM provider abstraction for API-based and local completion backends."""
 
 import os
+import re
 import json
 import logging
 from typing import Optional, Dict, Any, List
 import urllib.request
 import urllib.error
+
+def _extract_gemini_text(data: Dict[str, Any]) -> str:
+    """Extract final answer text from Gemini API response, filtering out internal thought/thinking parts."""
+    candidates = data.get("candidates", [])
+    if not candidates:
+        return ""
+    content = candidates[0].get("content", {})
+    parts = content.get("parts", [])
+    if not parts:
+        return ""
+
+    # Filter out internal thought parts (Gemini 2.0 / 2.5 thinking models return {"thought": True, "text": "..."})
+    answer_parts = [p.get("text", "") for p in parts if not p.get("thought") and p.get("text")]
+    if not answer_parts:
+        # Fallback to the last part if all were tagged with thought
+        answer_parts = [parts[-1].get("text", "")] if parts[-1].get("text") else [p.get("text", "") for p in parts if p.get("text")]
+
+    full_text = "\n".join(answer_parts).strip()
+    # Strip any <thought>...</thought> or <think>...</think> XML blocks
+    full_text = re.sub(r'<(thought|think)>.*?</\1>', '', full_text, flags=re.DOTALL).strip()
+    return full_text
+
 
 try:
     from dotenv import load_dotenv
@@ -81,20 +104,20 @@ class LLMProvider:
         if not api_key:
             raise ValueError("GEMINI_API_KEY environment variable not set")
 
-        contents = []
-        if system_prompt:
-            contents.append({"role": "user", "parts": [{"text": f"System Instructions: {system_prompt}"}]})
-            contents.append({"role": "model", "parts": [{"text": "Understood."}]})
-        contents.append({"role": "user", "parts": [{"text": prompt}]})
+        contents = [{"role": "user", "parts": [{"text": prompt}]}]
 
         gen_config: Dict[str, Any] = {"temperature": temperature}
         if as_json:
             gen_config["responseMimeType"] = "application/json"
 
-        payload = {
+        payload: Dict[str, Any] = {
             "contents": contents,
             "generationConfig": gen_config
         }
+        if system_prompt:
+            payload["systemInstruction"] = {
+                "parts": [{"text": system_prompt}]
+            }
 
         models_to_try = [self.model_name] if self.model_name else []
         for cand in ["gemini-3.6-flash", "gemini-flash-latest", "gemini-2.5-flash", "gemini-1.5-flash", "gemma-4-26b-a4b-it"]:
@@ -110,10 +133,10 @@ class LLMProvider:
                 headers={"Content-Type": "application/json"}
             )
             try:
-                with urllib.request.urlopen(req, timeout=8) as resp:
+                with urllib.request.urlopen(req, timeout=30) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                     self.model_name = model
-                    return data["candidates"][0]["content"]["parts"][0]["text"]
+                    return _extract_gemini_text(data)
             except urllib.error.HTTPError as e:
                 last_err = e
                 if e.code in [404, 400, 429, 503]:
@@ -201,11 +224,6 @@ class LLMProvider:
         if not api_key:
             return self.generate(prompt, system_prompt=system_prompt, temperature=temperature)
 
-        contents = []
-        if system_prompt:
-            contents.append({"role": "user", "parts": [{"text": f"System Instructions: {system_prompt}"}]})
-            contents.append({"role": "model", "parts": [{"text": "Understood. I will answer strictly using the verified evidence, tables, and images provided."}]})
-
         user_parts: List[Dict[str, Any]] = [{"text": prompt}]
         for img in images:
             b64_data = img.get("data", "")
@@ -218,12 +236,16 @@ class LLMProvider:
                     }
                 })
 
-        contents.append({"role": "user", "parts": user_parts})
+        contents = [{"role": "user", "parts": user_parts}]
 
-        payload = {
+        payload: Dict[str, Any] = {
             "contents": contents,
             "generationConfig": {"temperature": temperature}
         }
+        if system_prompt:
+            payload["systemInstruction"] = {
+                "parts": [{"text": system_prompt}]
+            }
 
         models_to_try = [self.model_name] if self.model_name else []
         for cand in ["gemini-3.6-flash", "gemini-flash-latest", "gemini-2.5-flash", "gemini-1.5-flash", "gemma-4-26b-a4b-it"]:
@@ -242,7 +264,7 @@ class LLMProvider:
                 with urllib.request.urlopen(req, timeout=90) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                     self.model_name = model
-                    return data["candidates"][0]["content"]["parts"][0]["text"]
+                    return _extract_gemini_text(data)
             except urllib.error.HTTPError as e:
                 last_err = e
                 if e.code in [404, 400, 429]:
