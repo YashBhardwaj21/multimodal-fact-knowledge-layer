@@ -21,7 +21,7 @@ class ChatEngine:
         session_id: Optional[str] = None,
         session: Optional[WorkspaceSession] = None,
         vector_store: Optional[SessionVectorStore] = None,
-        storage_base: str = "storage/buckets"
+        storage_base: str = "data/object_store"
     ):
         self.llm = llm_provider or LLMProvider()
         self.session_id = session_id or (session.id if session else None)

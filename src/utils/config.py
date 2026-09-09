@@ -26,7 +26,7 @@ class Config:
                 'model_name': 'Qwen/Qwen3-VL-4B-Instruct'
             },
             'storage': {
-                'base_dir': 'storage/buckets',
+                'base_dir': 'data/object_store',
                 'max_quota_gb': 10
             },
             'paths': {

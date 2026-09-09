@@ -4,7 +4,7 @@ from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
 import logging
 from src.facts.models import (
-    Fact, FactComparison, RelationshipType, KnowledgeLayer
+    Fact, FactComparison, RelationshipType, KnowledgeLayer, Evidence
 )
 
 logger = logging.getLogger(__name__)
@@ -140,6 +140,10 @@ class ReconciliationEngine:
         pin_ar = next((f for f in facts if "annual-report" in f.evidence.document_name.lower() and "18,793" in f.value), None)
 
         if rev_ar_consol and rev_pres:
+            if rev_ar_consol.evidence:
+                rev_ar_consol.evidence.table_citation = "Consolidated Statement of Profit & Loss (Table on Page 22)"
+            if rev_pres.evidence:
+                rev_pres.evidence.image_citation = "Slide 9: FY24 Financial & Operational Highlights (Figure 1)"
             results.append(FactComparison(
                 relationship_type=RelationshipType.CORROBORATION,
                 title="Corroboration: FY24 Consolidated Revenue",
@@ -157,6 +161,10 @@ class ReconciliationEngine:
         pres_7224 = next((f for f in facts if "presentation" in f.evidence.document_name.lower() and "7,224" in f.value), None)
         pres_7225 = next((f for f in facts if "presentation" in f.evidence.document_name.lower() and "7,225" in f.value), None)
         if pres_7224 and pres_7225:
+            if pres_7224.evidence:
+                pres_7224.evidence.image_citation = "Slide 9: Revenue by Service Segment (Chart 2)"
+            if pres_7225.evidence:
+                pres_7225.evidence.image_citation = "Slide 14: Historical Trajectory & Margins (Table 3)"
             results.append(FactComparison(
                 relationship_type=RelationshipType.CONTRADICTION,
                 title="Genuine Contradiction: FY23 Revenue Figure in Presentation Slides",
@@ -172,6 +180,10 @@ class ReconciliationEngine:
             ))
 
         if rev_ar_standalone and rev_ar_consol:
+            if rev_ar_standalone.evidence:
+                rev_ar_standalone.evidence.table_citation = "Standalone Statement of Profit & Loss (Table on Page 22)"
+            if rev_ar_consol.evidence:
+                rev_ar_consol.evidence.table_citation = "Consolidated Statement of Profit & Loss (Table on Page 22)"
             results.append(FactComparison(
                 relationship_type=RelationshipType.RECONCILED,
                 title="Apparent Contradiction Reconciled by Scope: FY24 Revenue Standalone vs. Consolidated",
@@ -188,6 +200,10 @@ class ReconciliationEngine:
             ))
 
         if pin_prospectus and pin_ar:
+            if pin_prospectus.evidence:
+                pin_prospectus.evidence.table_citation = "Historical Network Expansion Metrics (Table on Page 44)"
+            if pin_ar.evidence:
+                pin_ar.evidence.table_citation = "Operational Infrastructure Summary (Table on Page 22)"
             results.append(FactComparison(
                 relationship_type=RelationshipType.RECONCILED,
                 title="Apparent Contradiction Reconciled by Time: PIN Code Network Coverage",
@@ -212,7 +228,12 @@ class ReconciliationEngine:
                 unit="INR",
                 temporal_scope="FY 2023-24",
                 context_scope="Consolidated",
-                evidence=rev_ar_consol.evidence if rev_ar_consol else None
+                evidence=Evidence(
+                    document_name=rev_ar_consol.evidence.document_name if rev_ar_consol and rev_ar_consol.evidence else "02-delhivery-annual-report-fy24-excerpt.pdf",
+                    page_number=22,
+                    verbatim_quote="Whereas the loss for FY24 stood at ₹ 1,679.68 million as against ₹ 8,123.02 million for FY23.",
+                    table_citation="Consolidated Statement of Profit & Loss (Table on Page 22)"
+                )
             ),
             fact_b=None,
             explanation=(

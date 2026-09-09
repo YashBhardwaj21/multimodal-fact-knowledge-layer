@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { 
-  FileText, Upload, Search, MessageSquare, Database, Share2, 
-  Settings, CheckCircle2, ChevronRight, ArrowLeft, Send, 
+import {
+  FileText, Upload, Search, MessageSquare, Database, Share2,
+  Settings, CheckCircle2, ChevronRight, ArrowLeft, Send,
   ExternalLink, Layers, Table, Image, ShieldCheck, Sparkles, Plus,
   Bookmark, HelpCircle, HardDrive, RefreshCw, X, Folder, ChevronDown,
   Edit2, Trash2, MoreVertical
@@ -21,10 +21,17 @@ export default function App() {
 
   // Selected document & tab state
   const [selectedDoc, setSelectedDoc] = useState(null);
-  const [activeTab, setActiveTab] = useState('Chat'); // Chat | Key Facts | Tables | Figures | Structure | Reconciliation
+  const [activeTab, setActiveTab] = useState('Key Facts'); // Key Facts | Tables | Figures | Structure | Reconciliation
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedTagFilter, setSelectedTagFilter] = useState('');
   const [navSection, setNavSection] = useState('Documents'); // Documents | Ask | Knowledge Graph
+
+  // Custom Themed Modals
+  const [createWsModal, setCreateWsModal] = useState({ isOpen: false, title: '' });
+  const [renameWsModal, setRenameWsModal] = useState({ isOpen: false, session: null, newTitle: '' });
+  const [deleteWsModal, setDeleteWsModal] = useState({ isOpen: false, session: null });
+  const [deleteDocModal, setDeleteDocModal] = useState({ isOpen: false, doc: null });
+  const [modalError, setModalError] = useState('');
 
   // Chat state
   const [chatMessages, setChatMessages] = useState([]);
@@ -147,44 +154,59 @@ export default function App() {
     }
   };
 
-  const handleCreateSession = async (promptForTitle = true) => {
-    let title = '';
-    const defaultTitle = `Workspace ${sessions.length + 1}`;
-    if (promptForTitle) {
-      const input = prompt('Enter a title for the new workspace:', defaultTitle);
-      if (input === null) return; // User cancelled
-      title = input.trim() || defaultTitle;
-    } else {
-      title = defaultTitle;
-    }
+  const handleOpenCreateModal = () => {
+    setModalError('');
+    setCreateWsModal({ isOpen: true, title: `Workspace ${sessions.length + 1}` });
+  };
 
+  const handleCreateSession = () => {
+    handleOpenCreateModal();
+  };
+
+  const executeCreateWorkspace = async () => {
+    const title = createWsModal.title.trim() || `Workspace ${sessions.length + 1}`;
     try {
       const res = await fetch('/api/sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ title, description: 'Interactive document intelligence workspace.' })
       });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || 'Failed to create workspace');
+      }
       const newSession = await res.json();
       await fetchSessions();
       setCurrentSessionId(newSession.id);
       setShowWorkspaceDropdown(false);
-      setNavSection('Ask');
+      setNavSection('Documents');
       setSelectedDoc(null);
+      setCreateWsModal({ isOpen: false, title: '' });
+      setModalError('');
     } catch (err) {
-      alert('Failed to create workspace: ' + err.message);
+      setModalError(err.message);
     }
   };
 
-  const handleRenameWorkspace = async (sessionToRename) => {
+  const handleOpenRenameModal = (sessionToRename) => {
     setContextMenu(null);
-    const newTitle = prompt('Enter a new name for this workspace:', sessionToRename.title);
-    if (!newTitle || !newTitle.trim() || newTitle.trim() === sessionToRename.title) return;
+    setModalError('');
+    setRenameWsModal({ isOpen: true, session: sessionToRename, newTitle: sessionToRename.title });
+  };
+
+  const executeRenameWorkspace = async () => {
+    if (!renameWsModal.session) return;
+    const cleanTitle = renameWsModal.newTitle.trim();
+    if (!cleanTitle) {
+      setModalError('Workspace title cannot be empty.');
+      return;
+    }
 
     try {
-      const res = await fetch(`/api/sessions/${sessionToRename.id}`, {
+      const res = await fetch(`/api/sessions/${renameWsModal.session.id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: newTitle.trim() })
+        body: JSON.stringify({ title: cleanTitle })
       });
       if (!res.ok) {
         const err = await res.json();
@@ -192,23 +214,26 @@ export default function App() {
       }
 
       await fetchSessions();
-      if (currentSessionId === sessionToRename.id) {
+      if (currentSessionId === renameWsModal.session.id) {
         await loadSessionDetails(currentSessionId);
       }
+      setRenameWsModal({ isOpen: false, session: null, newTitle: '' });
+      setModalError('');
     } catch (err) {
-      alert('Error renaming workspace: ' + err.message);
+      setModalError(err.message);
     }
   };
 
-  const handleDeleteWorkspace = async (sessionToDelete) => {
+  const handleOpenDeleteModal = (sessionToDelete) => {
     setContextMenu(null);
-    const confirmed = window.confirm(
-      `Permanently delete workspace "${sessionToDelete.title}"?\n\nThis will completely purge all uploaded documents, vector indices, and database records with no records left.`
-    );
-    if (!confirmed) return;
+    setModalError('');
+    setDeleteWsModal({ isOpen: true, session: sessionToDelete });
+  };
 
+  const executeDeleteWorkspace = async () => {
+    if (!deleteWsModal.session) return;
     try {
-      const res = await fetch(`/api/sessions/${sessionToDelete.id}`, {
+      const res = await fetch(`/api/sessions/${deleteWsModal.session.id}`, {
         method: 'DELETE'
       });
       if (!res.ok) {
@@ -220,7 +245,7 @@ export default function App() {
       const updatedSessions = await updatedRes.json();
       setSessions(updatedSessions);
 
-      if (currentSessionId === sessionToDelete.id) {
+      if (currentSessionId === deleteWsModal.session.id) {
         if (updatedSessions.length > 0) {
           setCurrentSessionId(updatedSessions[0].id);
         } else {
@@ -229,8 +254,40 @@ export default function App() {
         }
       }
       await fetchStorageQuota();
+      setDeleteWsModal({ isOpen: false, session: null });
+      setModalError('');
     } catch (err) {
-      alert('Error deleting workspace: ' + err.message);
+      setModalError(err.message);
+    }
+  };
+
+  const handleOpenDeleteDocModal = (e, doc) => {
+    if (e && e.stopPropagation) e.stopPropagation();
+    setModalError('');
+    setDeleteDocModal({ isOpen: true, doc });
+  };
+
+  const executeDeleteDocument = async () => {
+    if (!deleteDocModal.doc || !currentSessionId) return;
+    try {
+      const docId = deleteDocModal.doc.id || deleteDocModal.doc.doc_id || deleteDocModal.doc.filename;
+      const res = await fetch(`/api/sessions/${currentSessionId}/documents/${encodeURIComponent(docId)}`, {
+        method: 'DELETE'
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || 'Failed to delete document');
+      }
+
+      if (selectedDoc && (selectedDoc.id === docId || selectedDoc.filename === deleteDocModal.doc.filename)) {
+        setSelectedDoc(null);
+      }
+      setDeleteDocModal({ isOpen: false, doc: null });
+      setModalError('');
+      await loadSessionDetails(currentSessionId);
+      await fetchStorageQuota();
+    } catch (err) {
+      setModalError(err.message);
     }
   };
 
@@ -315,7 +372,7 @@ export default function App() {
       const res = await fetch(`/api/sessions/${currentSessionId}/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
+        body: JSON.stringify({
           query: q,
           document_name: selectedDoc?.filename,
           doc_id: selectedDoc?.doc_id
@@ -346,7 +403,7 @@ export default function App() {
 
   const filteredDocs = (sessionData?.documents || []).filter(d => {
     const query = searchQuery.toLowerCase();
-    const matchesSearch = !searchQuery || 
+    const matchesSearch = !searchQuery ||
       (d.title && d.title.toLowerCase().includes(query)) ||
       (d.summary && d.summary.toLowerCase().includes(query)) ||
       (d.tags && d.tags.some(t => t.toLowerCase().includes(query)));
@@ -364,10 +421,10 @@ export default function App() {
 
   const docFigures = selectedDoc
     ? sessionFigures.filter(f => {
-        if (!f.document) return true;
-        const normDoc = selectedDoc.filename.replace(/\.pdf$/i, '').toLowerCase();
-        return f.document.toLowerCase() === normDoc || f.document === selectedDoc.doc_id;
-      })
+      if (!f.document) return true;
+      const normDoc = selectedDoc.filename.replace(/\.pdf$/i, '').toLowerCase();
+      return f.document.toLowerCase() === normDoc || f.document === selectedDoc.doc_id;
+    })
     : sessionFigures;
 
   const activeSessionObj = sessions.find(s => s.id === currentSessionId) || sessionData;
@@ -378,23 +435,14 @@ export default function App() {
         {/* Top Navbar */}
         <header className="landing-navbar">
           <div className="landing-brand">
-            <div className="landing-brand-icon">
-              <FileText size={22} />
-            </div>
-            <div>
-              <h1 className="landing-brand-title">Document Intelligence</h1>
-              <p className="landing-brand-subtitle">From Documents to Knowledge</p>
-            </div>
+            <img src="/globe-logo.png" alt="Meridian" className="landing-brand-logo" />
+            <h1 className="landing-brand-title">Meridian</h1>
           </div>
 
           <nav className="landing-nav-links">
-            <span className="landing-nav-item">Features</span>
-            <span className="landing-nav-item">How it works</span>
-            <span className="landing-nav-item">Use cases</span>
-            <span className="landing-nav-item" onClick={() => window.open('/docs', '_blank')}>Docs</span>
             {sessions.length > 0 && (
-              <button 
-                className="landing-nav-workspace-btn" 
+              <button
+                className="landing-nav-workspace-btn"
                 onClick={() => setCurrentView('workspace')}
                 title="Open active workspace"
               >
@@ -407,16 +455,11 @@ export default function App() {
         {/* Center Hero Body */}
         <section className="landing-hero-body">
           <div className="landing-hero-left">
-            <span className="landing-eyebrow">DOCUMENTS CONTAIN KNOWLEDGE.</span>
             <h1 className="landing-main-title">
               Turn complex<br />
               documents into<br />
               <span className="landing-highlight-text">trusted knowledge.</span>
             </h1>
-            <p className="landing-desc-para">
-              Understand, compare, and draw insights from text,
-              tables, and figures &mdash; all grounded in the original source.
-            </p>
             <button className="landing-cta-link" onClick={handleStartConversation}>
               <span>Start a conversation with your documents</span>
               <span className="landing-cta-arrow">&rarr;</span>
@@ -425,9 +468,9 @@ export default function App() {
 
           <div className="landing-hero-right">
             <div className="landing-hero-image-wrapper">
-              <img 
-                src="/hero-docs.jpg" 
-                alt="Document Intelligence Reports" 
+              <img
+                src="/books-transparent.png"
+                alt="Meridian Books"
                 className="landing-hero-image"
               />
             </div>
@@ -436,16 +479,12 @@ export default function App() {
 
         {/* Bottom Footer Row */}
         <footer className="landing-footer-row">
-          <div className="landing-footer-left">
-            <span>MORE SIGNAL.</span>
-            <span>A MORE INFORMED TOMORROW.</span>
-          </div>
+          <div className="landing-footer-left"></div>
 
           <div className="landing-footer-right">
-            <div className="landing-footer-rule"></div>
             <div className="landing-footer-right-text">
-              <span>KNOWLEDGE</span>
-              <span>BUILDS BRIGHTER FUTURES</span>
+              <span>MORE SIGNAL.</span>
+              <span>A MORE INFORMED TOMORROW.</span>
             </div>
           </div>
         </footer>
@@ -458,23 +497,20 @@ export default function App() {
       {/* Top Navbar */}
       <header className="top-navbar">
         {/* Left: Brand Logo & Title - clicking takes to home/landing page */}
-        <div 
-          className="brand-wrapper" 
-          onClick={() => setCurrentView('landing')} 
-          title="Document Intelligence - Click to go to Home"
+        <div
+          className="brand-wrapper"
+          onClick={() => setCurrentView('landing')}
+          title="Meridian - Click to go to Home"
         >
-          <div className="brand-icon">
-            <FileText size={22} />
-          </div>
+          <img src="/globe-logo.png" alt="Meridian" className="brand-logo-img" />
           <div>
-            <h1 className="brand-title">Document Intelligence</h1>
-            <p className="brand-sub">From Documents to Knowledge</p>
+            <h1 className="brand-title">Meridian</h1>
           </div>
         </div>
 
         {/* Center: Expressive Workspace Pill & Dropdown */}
         <div className="workspace-center-container" onClick={(e) => e.stopPropagation()}>
-          <button 
+          <button
             className={`workspace-pill-btn ${showWorkspaceDropdown ? 'active' : ''}`}
             onClick={() => setShowWorkspaceDropdown(prev => !prev)}
             title="Click to switch workspace, right-click any to rename or delete"
@@ -493,7 +529,7 @@ export default function App() {
                   <Plus size={14} /> New
                 </button>
               </div>
-              
+
               <div className="workspace-dropdown-list">
                 {sessions.length === 0 ? (
                   <div style={{ padding: '24px 16px', textAlign: 'center', color: 'var(--text-muted)', fontSize: '0.88rem' }}>
@@ -548,7 +584,7 @@ export default function App() {
 
       {/* Floating Context Menu for Workspace Right-Click */}
       {contextMenu && (
-        <div 
+        <div
           className="context-menu-floating"
           style={{ top: contextMenu.y, left: contextMenu.x }}
           onClick={(e) => e.stopPropagation()}
@@ -556,16 +592,16 @@ export default function App() {
           <div className="context-menu-title">
             {contextMenu.session.title}
           </div>
-          <div 
+          <div
             className="context-menu-item"
-            onClick={() => handleRenameWorkspace(contextMenu.session)}
+            onClick={() => handleOpenRenameModal(contextMenu.session)}
           >
             <Edit2 size={14} />
             <span>Rename Workspace</span>
           </div>
-          <div 
+          <div
             className="context-menu-item danger"
-            onClick={() => handleDeleteWorkspace(contextMenu.session)}
+            onClick={() => handleOpenDeleteModal(contextMenu.session)}
           >
             <Trash2 size={14} />
             <span>Delete Workspace</span>
@@ -578,21 +614,21 @@ export default function App() {
         {/* Left Sidebar */}
         <aside className="workspace-sidebar">
           <div className="sidebar-nav">
-            <div 
+            <div
               className={`sidebar-item ${navSection === 'Documents' ? 'active' : ''}`}
               onClick={() => setNavSection('Documents')}
             >
               <FileText size={18} />
               <span>Documents</span>
             </div>
-            <div 
+            <div
               className={`sidebar-item ${navSection === 'Ask' ? 'active' : ''}`}
               onClick={() => { setNavSection('Ask'); setActiveTab('Chat'); }}
             >
               <MessageSquare size={18} />
               <span>Ask</span>
             </div>
-            <div 
+            <div
               className={`sidebar-item ${navSection === 'Knowledge Graph' ? 'active' : ''}`}
               onClick={() => { setNavSection('Knowledge Graph'); setActiveTab('Reconciliation'); }}
             >
@@ -609,9 +645,9 @@ export default function App() {
                 <span>{storageQuota.display_text}</span>
               </div>
               <div className="storage-bar-bg">
-                <div 
-                  className="storage-bar-fill" 
-                  style={{ width: `${storageQuota.usage_percentage ?? 0}%` }} 
+                <div
+                  className="storage-bar-fill"
+                  style={{ width: `${storageQuota.usage_percentage ?? 0}%` }}
                 />
               </div>
             </div>
@@ -636,8 +672,8 @@ export default function App() {
             <p style={{ color: 'var(--text-muted)', maxWidth: 420, marginBottom: 24, fontSize: '0.92rem' }}>
               Create a workspace to upload PDF documents, inspect grounded facts, and ask intelligent questions.
             </p>
-            <button 
-              className="landing-cta-link" 
+            <button
+              className="landing-cta-link"
               onClick={() => handleCreateSession(true)}
               style={{ padding: '12px 24px', fontSize: '0.95rem', display: 'inline-flex', alignItems: 'center', gap: 8 }}
             >
@@ -666,8 +702,8 @@ export default function App() {
                   </span>
                 </div>
                 {selectedDoc && (
-                  <button 
-                    className="btn-outline" 
+                  <button
+                    className="btn-outline"
                     style={{ fontSize: '0.78rem', padding: '5px 12px' }}
                     onClick={() => setSelectedDoc(null)}
                   >
@@ -679,7 +715,7 @@ export default function App() {
               {/* Chat Stream */}
               <div className="ask-stream-scrollable">
                 {chatMessages.map((msg) => (
-                  <div 
+                  <div
                     key={msg.id}
                     className={msg.role === 'user' ? 'chat-bubble-user' : 'chat-bubble-ai'}
                   >
@@ -704,8 +740,8 @@ export default function App() {
 
                           <div className="evidence-snippet-preview">
                             <div className="evidence-mini-thumb">
-                              <img 
-                                src={msg.citations[0].thumbnail_url} 
+                              <img
+                                src={msg.citations[0].thumbnail_url}
                                 alt="Source Page"
                                 onError={(e) => { e.target.style.display = 'none'; }}
                               />
@@ -739,21 +775,21 @@ export default function App() {
                   </button>
                 </div>
 
-                <form 
+                <form
                   className="ask-bottom-center-box"
                   onSubmit={(e) => { e.preventDefault(); handleSendMessage(); }}
                 >
                   <Search size={18} style={{ color: 'var(--text-muted)' }} />
-                  <input 
-                    type="text" 
+                  <input
+                    type="text"
                     className="ask-bottom-input"
                     placeholder={selectedDoc ? `Ask about "${selectedDoc.title}"...` : "Ask a question across all documents in this workspace..."}
                     value={inputQuery}
                     onChange={(e) => setInputQuery(e.target.value)}
                     disabled={isAsking}
                   />
-                  <button 
-                    type="submit" 
+                  <button
+                    type="submit"
                     className="ask-send-btn"
                     disabled={!inputQuery.trim() || isAsking}
                   >
@@ -772,7 +808,7 @@ export default function App() {
                 </p>
               </div>
 
-              <div 
+              <div
                 className={`ask-docs-scope-all ${selectedDoc === null ? 'active' : ''}`}
                 onClick={() => setSelectedDoc(null)}
                 title="Query all documents simultaneously"
@@ -790,7 +826,7 @@ export default function App() {
                 {(sessionData?.documents || []).map((doc) => {
                   const isFocused = selectedDoc?.filename === doc.filename;
                   return (
-                    <div 
+                    <div
                       key={doc.doc_id || doc.filename}
                       className={`ask-doc-card-item ${isFocused ? 'active' : ''}`}
                       onClick={() => setSelectedDoc(doc)}
@@ -836,14 +872,14 @@ export default function App() {
               <div className="filter-controls-row">
                 <div className="search-input-box">
                   <Search size={16} className="search-icon-pos" />
-                  <input 
-                    type="text" 
-                    placeholder="Search documents by title, tags, or content..." 
+                  <input
+                    type="text"
+                    placeholder="Search documents by title, tags, or content..."
                     value={searchQuery}
                     onChange={(e) => setSearchQuery(e.target.value)}
                   />
                 </div>
-                <select 
+                <select
                   className="filter-select"
                   value={selectedTagFilter}
                   onChange={(e) => setSelectedTagFilter(e.target.value)}
@@ -861,15 +897,15 @@ export default function App() {
                   const isSelected = selectedDoc?.filename === doc.filename;
                   const thumbUrl = `/api/sessions/${currentSessionId}/documents/${doc.filename.replace('.pdf', '')}/pages/1/thumbnail`;
                   return (
-                    <div 
+                    <div
                       key={doc.doc_id || doc.filename}
                       className={`doc-card ${isSelected ? 'selected' : ''}`}
                       onClick={() => setSelectedDoc(doc)}
                     >
                       <div className="doc-card-thumb">
-                        <img 
-                          src={thumbUrl} 
-                          alt="Thumbnail" 
+                        <img
+                          src={thumbUrl}
+                          alt="Thumbnail"
                           onError={(e) => { e.target.style.display = 'none'; }}
                         />
                         <FileText size={24} color="#9c8e7e" />
@@ -878,9 +914,18 @@ export default function App() {
                       <div className="doc-card-content">
                         <div className="doc-card-header">
                           <h3 className="doc-card-title">{doc.title}</h3>
-                          <span className="status-badge-processed">
-                            <CheckCircle2 size={12} /> {doc.status || 'Processed'}
-                          </span>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            <span className="status-badge-processed">
+                              <CheckCircle2 size={12} /> {doc.status || 'Processed'}
+                            </span>
+                            <button
+                              className="doc-delete-btn"
+                              title="Delete document from workspace & storage"
+                              onClick={(e) => handleOpenDeleteDocModal(e, doc)}
+                            >
+                              <Trash2 size={14} />
+                            </button>
+                          </div>
                         </div>
 
                         <p className="doc-card-meta">
@@ -925,18 +970,31 @@ export default function App() {
                       <ArrowLeft size={18} />
                       <span>{selectedDoc.title}</span>
                     </div>
-                    <button 
-                      className="btn-outline" 
-                      onClick={() => window.open(`/api/sessions/${currentSessionId}/documents/${selectedDoc.filename.replace('.pdf', '')}/pages/1/thumbnail`, '_blank')}
-                    >
-                      <ExternalLink size={14} /> Open Preview
-                    </button>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      <button
+                        className="btn-primary"
+                        style={{ padding: '6px 14px', fontSize: '0.82rem', display: 'inline-flex', alignItems: 'center', gap: '6px' }}
+                        onClick={() => {
+                          setNavSection('Ask');
+                        }}
+                        title="Open conversational Q&A focused on this document"
+                      >
+                        <MessageSquare size={14} />
+                        <span>Ask about this doc</span>
+                      </button>
+                      <button
+                        className="btn-outline"
+                        onClick={() => window.open(`/api/sessions/${currentSessionId}/documents/${selectedDoc.filename.replace('.pdf', '')}/pages/1/thumbnail`, '_blank')}
+                      >
+                        <ExternalLink size={14} /> Open Preview
+                      </button>
+                    </div>
                   </div>
 
-                  {/* View Tabs Bar */}
+                  {/* View Tabs Bar - Focused on Knowledge & Inspection */}
                   <div className="view-tabs-bar">
-                    {['Chat', 'Key Facts', 'Tables', 'Figures', 'Structure', 'Reconciliation'].map((tab) => (
-                      <div 
+                    {['Key Facts', 'Tables', 'Figures', 'Structure', 'Reconciliation'].map((tab) => (
+                      <div
                         key={tab}
                         className={`tab-item ${activeTab === tab ? 'active' : ''}`}
                         onClick={() => setActiveTab(tab)}
@@ -946,101 +1004,17 @@ export default function App() {
                     ))}
                   </div>
 
-                  {/* TAB 1: Chat Stream */}
-                  {activeTab === 'Chat' && (
-                    <>
-                      <div className="chat-stream-area">
-                        {chatMessages.map((msg) => (
-                          <div 
-                            key={msg.id}
-                            className={msg.role === 'user' ? 'chat-bubble-user' : 'chat-bubble-ai'}
-                          >
-                            {msg.role === 'assistant' && (
-                              <div className="ai-avatar-icon">
-                                <Sparkles size={16} />
-                              </div>
-                            )}
-
-                            <div className="ai-content-body">
-                              <div className="ai-text-narrative">
-                                {msg.content}
-                              </div>
-
-                              {/* Source Evidence Cards */}
-                              {msg.citations && msg.citations.length > 0 && (
-                                <div className="source-evidence-card">
-                                  <div className="evidence-badge-header">
-                                    <span>Source Evidence</span>
-                                    <span className="evidence-page-chip">Page {msg.citations[0].page_number}</span>
-                                  </div>
-
-                                  <div className="evidence-snippet-preview">
-                                    <div className="evidence-mini-thumb">
-                                      <img 
-                                        src={msg.citations[0].thumbnail_url} 
-                                        alt="Source Page"
-                                        onError={(e) => { e.target.style.display = 'none'; }}
-                                      />
-                                    </div>
-                                    <p className="evidence-quote-text">
-                                      "{msg.citations[0].verbatim_quote}"
-                                    </p>
-                                  </div>
-                                </div>
-                              )}
-                            </div>
-                          </div>
-                        ))}
-                        <div ref={chatEndRef} />
-                      </div>
-
-                      {/* Chat Input Bar */}
-                      <div className="chat-input-wrapper">
-                        <form 
-                          className="chat-input-box"
-                          onSubmit={(e) => { e.preventDefault(); handleSendMessage(); }}
-                        >
-                          <input 
-                            type="text" 
-                            placeholder="Ask a question about this document..."
-                            value={inputQuery}
-                            onChange={(e) => setInputQuery(e.target.value)}
-                            disabled={isAsking}
-                          />
-                          <button 
-                            type="submit" 
-                            className="chat-action-btn"
-                            disabled={!inputQuery.trim() || isAsking}
-                          >
-                            <Send size={16} />
-                          </button>
-                        </form>
-
-                        {/* Dynamic suggestion pills */}
-                        <div className="suggestion-chips-row">
-                          <button className="suggest-chip" onClick={() => handleSendMessage(`Summarize ${selectedDoc?.title || 'the document'}`)}>
-                            Summarize document
-                          </button>
-                          <button className="suggest-chip" onClick={() => handleSendMessage('What are the key points or instructions in this document?')}>
-                            Key points & instructions
-                          </button>
-                          <button className="suggest-chip" onClick={() => handleSendMessage('What specific metrics, numbers, or dates are mentioned?')}>
-                            Extract metrics & numbers
-                          </button>
-                          <button className="suggest-chip" onClick={() => handleSendMessage('Are there any conflicting figures or details?')}>
-                            Find contradictions
-                          </button>
-                        </div>
-                      </div>
-                    </>
-                  )}
-
-                  {/* TAB 2: Key Facts Catalog */}
+                  {/* TAB 1: Key Facts Catalog */}
                   {activeTab === 'Key Facts' && (
                     <div style={{ flex: 1, overflowY: 'auto', padding: '16px 0' }}>
-                      <h3 style={{ fontSize: '1.05rem', fontWeight: 700, marginBottom: '12px' }}>
-                        Verified Grounded Facts ({docFacts.length})
-                      </h3>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '14px' }}>
+                        <h3 style={{ fontSize: '1.05rem', fontWeight: 700 }}>
+                          Verified Grounded Facts ({docFacts.length})
+                        </h3>
+                        <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                          Canonical structured entities extracted with evidence quotes
+                        </span>
+                      </div>
                       <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
                         {docFacts.map((f, i) => (
                           <div key={i} style={{ border: '1px solid var(--border-subtle)', borderRadius: '10px', padding: '14px', background: '#faf8f5' }}>
@@ -1061,37 +1035,52 @@ export default function App() {
                           </div>
                         ))}
                         {docFacts.length === 0 && (
-                          <p style={{ color: 'var(--text-muted)', padding: '12px 0' }}>No structured numerical facts detected in this document.</p>
+                          <p style={{ color: 'var(--text-muted)', padding: '20px 0', textAlign: 'center' }}>
+                            No structured numerical facts detected in this document.
+                          </p>
                         )}
                       </div>
                     </div>
                   )}
 
-                  {/* TAB 3: Tables View */}
+                  {/* TAB 2: Tables View */}
                   {activeTab === 'Tables' && (
-                    <div style={{ flex: 1, overflowY: 'auto', padding: '16px 0' }}>
-                      <h3 style={{ fontSize: '1.05rem', fontWeight: 700, marginBottom: '12px' }}>
-                        Structured Table Observations ({docTables.length})
-                      </h3>
+                    <div style={{ flex: 1, overflowY: 'auto', padding: '16px 0', minWidth: 0 }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '14px' }}>
+                        <h3 style={{ fontSize: '1.05rem', fontWeight: 700 }}>
+                          Structured Table Observations ({docTables.length})
+                        </h3>
+                        <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                          Extracted from layout blocks with clean tabular formatting
+                        </span>
+                      </div>
+
                       {docTables.map((t, i) => (
-                        <div key={i} style={{ marginBottom: '20px', border: '1px solid var(--border-subtle)', borderRadius: '10px', overflow: 'hidden' }}>
-                          <div style={{ background: '#f4efe6', padding: '8px 14px', fontSize: '0.8rem', fontWeight: 600 }}>
-                            Table on Page {t.page_number} ({t.row_count} rows &times; {t.col_count} columns)
+                        <div key={i} className="table-scroll-wrapper">
+                          <div style={{ background: '#f7f4ee', padding: '10px 16px', fontSize: '0.82rem', fontWeight: 700, display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid var(--border-subtle)' }}>
+                            <span style={{ color: 'var(--text-title)' }}>
+                              Table on Page {t.page_number}
+                            </span>
+                            <span style={{ fontSize: '0.74rem', background: '#ece5d8', padding: '2px 8px', borderRadius: '4px', color: 'var(--text-muted)' }}>
+                              {t.row_count || t.rows?.length || 0} rows &times; {t.col_count || t.headers?.length || (t.rows?.[0]?.length || 0)} cols
+                            </span>
                           </div>
-                          <div style={{ overflowX: 'auto', padding: '12px' }}>
-                            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.82rem' }}>
-                              <thead>
-                                <tr>
-                                  {t.headers?.map((h, hi) => (
-                                    <th key={hi} style={{ borderBottom: '2px solid #ddd', padding: '6px 10px', textAlign: 'left', background: '#faf8f5' }}>{h}</th>
-                                  ))}
-                                </tr>
-                              </thead>
+                          <div style={{ overflowX: 'auto', width: '100%' }}>
+                            <table className="clean-data-table">
+                              {t.headers && t.headers.length > 0 && (
+                                <thead>
+                                  <tr>
+                                    {t.headers.map((h, hi) => (
+                                      <th key={hi}>{h || `Col ${hi + 1}`}</th>
+                                    ))}
+                                  </tr>
+                                </thead>
+                              )}
                               <tbody>
                                 {t.rows?.map((r, ri) => (
-                                  <tr key={ri} style={{ borderBottom: '1px solid #eee' }}>
+                                  <tr key={ri}>
                                     {r.map((cell, ci) => (
-                                      <td key={ci} style={{ padding: '6px 10px' }}>{cell}</td>
+                                      <td key={ci}>{cell}</td>
                                     ))}
                                   </tr>
                                 ))}
@@ -1100,11 +1089,15 @@ export default function App() {
                           </div>
                         </div>
                       ))}
-                      {docTables.length === 0 && <p style={{ color: 'var(--text-muted)' }}>No structured tables detected in this document.</p>}
+                      {docTables.length === 0 && (
+                        <p style={{ color: 'var(--text-muted)', padding: '20px 0', textAlign: 'center' }}>
+                          No structured tables detected in this document.
+                        </p>
+                      )}
                     </div>
                   )}
 
-                  {/* TAB 4: Figures View */}
+                  {/* TAB 3: Figures View */}
                   {activeTab === 'Figures' && (
                     <div style={{ flex: 1, overflowY: 'auto', padding: '16px 0' }}>
                       <h3 style={{ fontSize: '1.05rem', fontWeight: 700, marginBottom: '12px' }}>
@@ -1122,7 +1115,7 @@ export default function App() {
                     </div>
                   )}
 
-                  {/* TAB 5: Structure View */}
+                  {/* TAB 4: Structure View */}
                   {activeTab === 'Structure' && (
                     <div style={{ flex: 1, overflowY: 'auto', padding: '16px 0' }}>
                       <h3 style={{ fontSize: '1.05rem', fontWeight: 700, marginBottom: '12px' }}>
@@ -1140,31 +1133,133 @@ export default function App() {
                     </div>
                   )}
 
-                  {/* TAB 6: Cross-Document Reconciliation */}
+                  {/* TAB 5: Cross-Document Reconciliation */}
                   {activeTab === 'Reconciliation' && (
-                    <div style={{ flex: 1, overflowY: 'auto', padding: '16px 0' }}>
-                      <h3 style={{ fontSize: '1.05rem', fontWeight: 700, marginBottom: '12px' }}>
-                        Cross-Document Reconciliation Matrix
-                      </h3>
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                    <div style={{ flex: 1, overflowY: 'auto', padding: '16px 0', minWidth: 0 }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '14px' }}>
+                        <h3 style={{ fontSize: '1.05rem', fontWeight: 700 }}>
+                          Cross-Document Reconciliation Matrix ({sessionComparisons.length})
+                        </h3>
+                        <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                          Automated reasoning with exact page & table citations
+                        </span>
+                      </div>
+
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
                         {sessionComparisons.map((c, i) => (
-                          <div key={i} style={{ border: '1px solid var(--border-subtle)', borderRadius: '12px', padding: '16px', background: '#faf8f5' }}>
-                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-                              <h4 style={{ fontSize: '0.95rem', fontWeight: 700, color: 'var(--text-title)' }}>{c.title}</h4>
-                              <span style={{ textTransform: 'uppercase', fontSize: '0.72rem', fontWeight: 700, padding: '3px 8px', borderRadius: '4px', background: c.relationship_type === 'corroboration' ? 'var(--success-bg)' : c.relationship_type === 'contradiction' ? 'var(--danger-bg)' : 'var(--primary-light)', color: c.relationship_type === 'corroboration' ? 'var(--success)' : c.relationship_type === 'contradiction' ? 'var(--danger)' : 'var(--primary)' }}>
+                          <div key={i} style={{ border: '1px solid var(--border-subtle)', borderRadius: '12px', padding: '18px', background: '#faf8f5' }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+                              <h4 style={{ fontSize: '0.98rem', fontWeight: 700, color: 'var(--text-title)' }}>{c.title}</h4>
+                              <span style={{ textTransform: 'uppercase', fontSize: '0.72rem', fontWeight: 700, padding: '4px 10px', borderRadius: '4px', background: c.relationship_type === 'corroboration' ? 'var(--success-bg)' : c.relationship_type === 'contradiction' ? 'var(--danger-bg)' : 'var(--primary-light)', color: c.relationship_type === 'corroboration' ? 'var(--success)' : c.relationship_type === 'contradiction' ? 'var(--danger)' : 'var(--primary)' }}>
                                 {c.relationship_type}
                               </span>
                             </div>
-                            <p style={{ fontSize: '0.85rem', color: 'var(--text-body)', lineHeight: 1.5, marginBottom: '8px' }}>
+
+                            <p style={{ fontSize: '0.88rem', color: 'var(--text-body)', lineHeight: 1.5, marginBottom: '12px' }}>
                               {c.explanation}
                             </p>
+
                             {c.reconciliation_factor && (
-                              <div style={{ fontSize: '0.8rem', background: '#f2ece2', padding: '6px 10px', borderRadius: '6px', color: 'var(--primary)', fontWeight: 600 }}>
+                              <div style={{ fontSize: '0.82rem', background: '#f2ece2', padding: '8px 12px', borderRadius: '6px', color: 'var(--primary)', fontWeight: 600, marginBottom: '12px' }}>
                                 Resolution: {c.reconciliation_factor}
+                              </div>
+                            )}
+
+                            {/* Grounded Dual Evidence Comparison */}
+                            {(c.fact_a || c.fact_b) && (
+                              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginTop: '10px' }}>
+                                {c.fact_a && (
+                                  <div style={{ background: '#ffffff', border: '1px solid var(--border-subtle)', borderRadius: '8px', padding: '12px' }}>
+                                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
+                                      <span style={{ fontSize: '0.76rem', fontWeight: 700, color: 'var(--text-title)' }}>
+                                        {c.fact_a.evidence?.document_name || 'Document A'}
+                                      </span>
+                                      {c.fact_a.evidence?.page_number && (
+                                        <span className="reconciliation-citation-badge page">
+                                          Page {c.fact_a.evidence.page_number}
+                                        </span>
+                                      )}
+                                    </div>
+
+                                    {c.fact_a.evidence?.table_citation && (
+                                      <div style={{ marginBottom: '6px' }}>
+                                        <span className="reconciliation-citation-badge table">
+                                          <Table size={12} /> {c.fact_a.evidence.table_citation}
+                                        </span>
+                                      </div>
+                                    )}
+
+                                    {c.fact_a.evidence?.image_citation && (
+                                      <div style={{ marginBottom: '6px' }}>
+                                        <span className="reconciliation-citation-badge image">
+                                          <Image size={12} /> {c.fact_a.evidence.image_citation}
+                                        </span>
+                                      </div>
+                                    )}
+
+                                    <div style={{ fontSize: '0.86rem', fontWeight: 700, color: 'var(--primary)', margin: '4px 0' }}>
+                                      {c.fact_a.subject} &bull; {c.fact_a.attribute}: {c.fact_a.value}
+                                    </div>
+
+                                    {c.fact_a.evidence?.verbatim_quote && (
+                                      <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', fontStyle: 'italic', margin: 0 }}>
+                                        "{c.fact_a.evidence.verbatim_quote}"
+                                      </p>
+                                    )}
+                                  </div>
+                                )}
+
+                                {c.fact_b && (
+                                  <div style={{ background: '#ffffff', border: '1px solid var(--border-subtle)', borderRadius: '8px', padding: '12px' }}>
+                                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
+                                      <span style={{ fontSize: '0.76rem', fontWeight: 700, color: 'var(--text-title)' }}>
+                                        {c.fact_b.evidence?.document_name || 'Document B'}
+                                      </span>
+                                      {c.fact_b.evidence?.page_number && (
+                                        <span className="reconciliation-citation-badge page">
+                                          Page {c.fact_b.evidence.page_number}
+                                        </span>
+                                      )}
+                                    </div>
+
+                                    {c.fact_b.evidence?.table_citation && (
+                                      <div style={{ marginBottom: '6px' }}>
+                                        <span className="reconciliation-citation-badge table">
+                                          <Table size={12} /> {c.fact_b.evidence.table_citation}
+                                        </span>
+                                      </div>
+                                    )}
+
+                                    {c.fact_b.evidence?.image_citation && (
+                                      <div style={{ marginBottom: '6px' }}>
+                                        <span className="reconciliation-citation-badge image">
+                                          <Image size={12} /> {c.fact_b.evidence.image_citation}
+                                        </span>
+                                      </div>
+                                    )}
+
+                                    <div style={{ fontSize: '0.86rem', fontWeight: 700, color: 'var(--primary)', margin: '4px 0' }}>
+                                      {c.fact_b.subject} &bull; {c.fact_b.attribute}: {c.fact_b.value}
+                                    </div>
+
+                                    {c.fact_b.evidence?.verbatim_quote && (
+                                      <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', fontStyle: 'italic', margin: 0 }}>
+                                        "{c.fact_b.evidence.verbatim_quote}"
+                                      </p>
+                                    )}
+                                  </div>
+                                )}
                               </div>
                             )}
                           </div>
                         ))}
+
+                        {sessionComparisons.length === 0 && (
+                          <div style={{ textAlign: 'center', padding: '30px 10px', color: 'var(--text-muted)' }}>
+                            No cross-document reconciliations yet.<br />
+                            Upload multiple documents with overlapping financial or operational metrics to see automated corroborations and contradictions with exact table and page citations.
+                          </div>
+                        )}
                       </div>
                     </div>
                   )}
@@ -1192,7 +1287,7 @@ export default function App() {
               The uploaded file will be stored in isolated object storage for this chat and processed for text, tables, figures, and facts.
             </p>
 
-            <div 
+            <div
               className="dropzone-inner"
               onClick={() => fileInputRef.current?.click()}
               onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); }}
@@ -1205,10 +1300,10 @@ export default function App() {
               <Upload size={32} style={{ color: 'var(--primary)', margin: '0 auto 12px' }} />
               <p style={{ fontWeight: 600, marginBottom: '4px' }}>Click or drag PDF here to upload</p>
               <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Stored in isolated workspace bucket</span>
-              <input 
+              <input
                 ref={fileInputRef}
-                type="file" 
-                accept="application/pdf" 
+                type="file"
+                accept="application/pdf"
                 style={{ display: 'none' }}
                 onChange={(e) => e.target.files?.[0] && handleFileUpload(e.target.files[0])}
               />
@@ -1223,6 +1318,194 @@ export default function App() {
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '12px' }}>
               <button className="btn-outline" onClick={() => setShowUploadModal(false)}>
                 Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {/* Create Workspace Modal */}
+      {createWsModal.isOpen && (
+        <div className="modal-backdrop" onClick={() => setCreateWsModal({ isOpen: false, title: '' })}>
+          <div className="custom-modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="custom-modal-header">
+              <h3><Folder size={18} color="var(--primary)" /> Create New Workspace</h3>
+              <button
+                className="custom-modal-close-btn"
+                onClick={() => setCreateWsModal({ isOpen: false, title: '' })}
+              >
+                <X size={18} />
+              </button>
+            </div>
+            <div className="custom-modal-body">
+              <p>Workspaces provide isolated document ingestion, grounded facts, knowledge graphs, and conversational Q&A.</p>
+              <label style={{ display: 'block', fontSize: '0.82rem', fontWeight: 600, color: 'var(--text-title)', marginBottom: '6px' }}>
+                Workspace Title
+              </label>
+              <input
+                type="text"
+                className="custom-modal-input"
+                placeholder="e.g. FY24 Financial Reports"
+                value={createWsModal.title}
+                onChange={(e) => setCreateWsModal(prev => ({ ...prev, title: e.target.value }))}
+                onKeyDown={(e) => { if (e.key === 'Enter') executeCreateWorkspace(); }}
+                autoFocus
+              />
+              {modalError && (
+                <div style={{ color: '#d93822', fontSize: '0.8rem', marginTop: '8px' }}>
+                  {modalError}
+                </div>
+              )}
+            </div>
+            <div className="custom-modal-footer">
+              <button
+                className="modal-btn-cancel"
+                onClick={() => setCreateWsModal({ isOpen: false, title: '' })}
+              >
+                Cancel
+              </button>
+              <button
+                className="modal-btn-confirm"
+                onClick={executeCreateWorkspace}
+              >
+                <Plus size={16} /> Create Workspace
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Rename Workspace Modal */}
+      {renameWsModal.isOpen && (
+        <div className="modal-backdrop" onClick={() => setRenameWsModal({ isOpen: false, session: null, newTitle: '' })}>
+          <div className="custom-modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="custom-modal-header">
+              <h3><Edit2 size={18} color="var(--primary)" /> Rename Workspace</h3>
+              <button
+                className="custom-modal-close-btn"
+                onClick={() => setRenameWsModal({ isOpen: false, session: null, newTitle: '' })}
+              >
+                <X size={18} />
+              </button>
+            </div>
+            <div className="custom-modal-body">
+              <p>Update the name of this workspace.</p>
+              <label style={{ display: 'block', fontSize: '0.82rem', fontWeight: 600, color: 'var(--text-title)', marginBottom: '6px' }}>
+                New Title
+              </label>
+              <input
+                type="text"
+                className="custom-modal-input"
+                value={renameWsModal.newTitle}
+                onChange={(e) => setRenameWsModal(prev => ({ ...prev, newTitle: e.target.value }))}
+                onKeyDown={(e) => { if (e.key === 'Enter') executeRenameWorkspace(); }}
+                autoFocus
+              />
+              {modalError && (
+                <div style={{ color: '#d93822', fontSize: '0.8rem', marginTop: '8px' }}>
+                  {modalError}
+                </div>
+              )}
+            </div>
+            <div className="custom-modal-footer">
+              <button
+                className="modal-btn-cancel"
+                onClick={() => setRenameWsModal({ isOpen: false, session: null, newTitle: '' })}
+              >
+                Cancel
+              </button>
+              <button
+                className="modal-btn-confirm"
+                onClick={executeRenameWorkspace}
+              >
+                Save Name
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete Workspace Modal */}
+      {deleteWsModal.isOpen && (
+        <div className="modal-backdrop" onClick={() => setDeleteWsModal({ isOpen: false, session: null })}>
+          <div className="custom-modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="custom-modal-header">
+              <h3 style={{ color: '#d93822' }}><Trash2 size={18} color="#d93822" /> Delete Workspace</h3>
+              <button
+                className="custom-modal-close-btn"
+                onClick={() => setDeleteWsModal({ isOpen: false, session: null })}
+              >
+                <X size={18} />
+              </button>
+            </div>
+            <div className="custom-modal-body">
+              <p>
+                Are you sure you want to permanently delete <strong>{deleteWsModal.session?.title}</strong>?
+              </p>
+              <p style={{ fontSize: '0.84rem', color: 'var(--text-muted)' }}>
+                This action will completely purge all documents. This cannot be undone.
+              </p>
+              {modalError && (
+                <div style={{ color: '#d93822', fontSize: '0.8rem', marginTop: '8px' }}>
+                  {modalError}
+                </div>
+              )}
+            </div>
+            <div className="custom-modal-footer">
+              <button
+                className="modal-btn-cancel"
+                onClick={() => setDeleteWsModal({ isOpen: false, session: null })}
+              >
+                Cancel
+              </button>
+              <button
+                className="modal-btn-danger"
+                onClick={executeDeleteWorkspace}
+              >
+                <Trash2 size={16} /> Delete Workspace
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete Document Modal */}
+      {deleteDocModal.isOpen && (
+        <div className="modal-backdrop" onClick={() => setDeleteDocModal({ isOpen: false, doc: null })}>
+          <div className="custom-modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="custom-modal-header">
+              <h3 style={{ color: '#d93822' }}><Trash2 size={18} color="#d93822" /> Delete Document</h3>
+              <button
+                className="custom-modal-close-btn"
+                onClick={() => setDeleteDocModal({ isOpen: false, doc: null })}
+              >
+                <X size={18} />
+              </button>
+            </div>
+            <div className="custom-modal-body">
+              <p>
+                Permanently delete <strong>{deleteDocModal.doc?.title}</strong> (<code>{deleteDocModal.doc?.filename}</code>)?
+              </p>
+              <p style={{ fontSize: '0.84rem', color: 'var(--text-muted)' }}>
+                This removes the document from this workspace, deletes its extracted pages, facts, and evidence from SQLite, purges its vector embeddings, and removes its stored PDF and image assets from Object Storage.
+              </p>
+              {modalError && (
+                <div style={{ color: '#d93822', fontSize: '0.8rem', marginTop: '8px' }}>
+                  {modalError}
+                </div>
+              )}
+            </div>
+            <div className="custom-modal-footer">
+              <button
+                className="modal-btn-cancel"
+                onClick={() => setDeleteDocModal({ isOpen: false, doc: null })}
+              >
+                Cancel
+              </button>
+              <button
+                className="modal-btn-danger"
+                onClick={executeDeleteDocument}
+              >
+                <Trash2 size={16} /> Delete Document
               </button>
             </div>
           </div>

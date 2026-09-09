@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 class SessionVectorStore:
     """Manages isolated vector embeddings and retrieval for a single session."""
 
-    def __init__(self, session_id: str, storage_base: str = "storage/buckets"):
+    def __init__(self, session_id: str, storage_base: str = "data/object_store"):
         self.session_id = session_id
         self.chroma_dir = Path(storage_base) / session_id / "chroma"
         self.chroma_dir.mkdir(parents=True, exist_ok=True)

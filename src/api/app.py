@@ -180,8 +180,14 @@ async def upload_document(session_id: str, file: UploadFile = File(...)):
         all_session_docs = sorted(list(set([d["filename"] for d in session.documents])))
         session.knowledge_layer = reconciler.reconcile(all_session_facts, all_session_docs)
 
-        # Persist document and updated knowledge layer into database
-        session_manager.add_document(session_id, doc_entry)
+        # Persist document, pages, facts, and relationships into SQLite database
+        session_manager.add_document(
+            session_id=session_id,
+            doc_entry=doc_entry,
+            pages=canonical_doc.pages,
+            facts=new_facts,
+            comparisons=session.knowledge_layer.comparisons
+        )
         session_manager.save_knowledge_layer(session_id, session.knowledge_layer)
 
         return {
@@ -211,10 +217,27 @@ def list_session_documents(session_id: str):
 
 @app.delete("/api/sessions/{session_id}/documents/{doc_id}")
 def delete_session_document(session_id: str, doc_id: str):
-    """Delete a document from a workspace and database."""
+    """Delete a document from a workspace, database, object store, and vector store."""
     session = session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Workspace session not found")
+
+    # Find matching document to get filename
+    target_doc = next((d for d in session.documents if d.get("id") == doc_id or d.get("doc_id") == doc_id or d.get("filename") == doc_id), None)
+    doc_filename = target_doc.get("filename") if target_doc else doc_id
+
+    # Purge vectors
+    try:
+        vstore = get_session_vector_store(session_id)
+        vstore.delete_document(doc_filename)
+    except Exception as e:
+        logger.warning(f"Error purging vectors for {doc_filename}: {e}")
+
+    # Remove from canonical cache
+    if session_id in SESSION_CANONICAL_DOCS:
+        SESSION_CANONICAL_DOCS[session_id].pop(doc_filename, None)
+
+    # Purge from SQLite and Object Store
     success = session_manager.delete_document(session_id, doc_id)
     if not success:
         raise HTTPException(status_code=404, detail="Document not found")

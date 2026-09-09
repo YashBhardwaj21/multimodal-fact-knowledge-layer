@@ -1,6 +1,7 @@
 """Multimodal document ingestion and canonical layout parsing."""
 
 import os
+import re
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field, asdict
@@ -225,25 +226,45 @@ class PDFLoader:
                 for t_idx, t in enumerate(tabs):
                     grid = t.extract()
                     if grid and len(grid) > 1:
-                        table_grids.append(grid)
-                        headers = [str(c or "").strip() for c in grid[0]]
-                        rows = [[str(c or "").strip() for c in r] for r in grid[1:]]
+                        # Sanitize cells and clean multiple spaces/newlines
+                        cleaned_grid = [
+                            [re.sub(r'\s+', ' ', str(c or '').replace('\r', ' ').replace('\n', ' ')).strip() for c in r]
+                            for r in grid
+                        ]
+                        num_cols = max(len(r) for r in cleaned_grid)
+                        cleaned_grid = [r + [""] * (num_cols - len(r)) for r in cleaned_grid]
 
-                        md_lines = ["| " + " | ".join(headers) + " |"]
-                        md_lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
-                        for r in rows:
-                            md_lines.append("| " + " | ".join(r) + " |")
-                        markdown_table = "\n".join(md_lines)
+                        # Prune columns that are 100% empty across header and all rows
+                        valid_col_indices = [
+                            c_i for c_i in range(num_cols)
+                            if any(len(r[c_i]) > 0 for r in cleaned_grid)
+                        ]
+                        if len(valid_col_indices) >= 2:
+                            cleaned_grid = [[r[c_i] for c_i in valid_col_indices] for r in cleaned_grid]
 
-                        all_tables.append(TableObservation(
-                            id=f"{doc_id}_p{page_num}_t{t_idx}",
-                            page_number=page_num,
-                            headers=headers,
-                            rows=rows,
-                            row_count=len(rows),
-                            col_count=len(headers),
-                            markdown=markdown_table
-                        ))
+                        # Prune rows that are completely empty
+                        cleaned_grid = [r for r in cleaned_grid if any(len(c) > 0 for c in r)]
+
+                        if len(cleaned_grid) > 1:
+                            table_grids.append(cleaned_grid)
+                            headers = cleaned_grid[0]
+                            rows = cleaned_grid[1:]
+
+                            md_lines = ["| " + " | ".join(headers) + " |"]
+                            md_lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+                            for r in rows:
+                                md_lines.append("| " + " | ".join(r) + " |")
+                            markdown_table = "\n".join(md_lines)
+
+                            all_tables.append(TableObservation(
+                                id=f"{doc_id}_p{page_num}_t{t_idx}",
+                                page_number=page_num,
+                                headers=headers,
+                                rows=rows,
+                                row_count=len(rows),
+                                col_count=len(headers),
+                                markdown=markdown_table
+                            ))
             except Exception as e:
                 logger.debug(f"Table extraction skipped for p.{page_num}: {e}")
 
