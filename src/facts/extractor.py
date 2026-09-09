@@ -1,27 +1,44 @@
-"""Fact extraction engine with verbatim source evidence grounding."""
+"""Extracts structured, verified facts from arbitrary PDF documents across all domains.
+
+Purely document-agnostic:
+- Extracts generic candidate primitives (currencies, percentages, operational units, counts, dates, table cells).
+- Discovers semantic facts via LLM with structured JSON output and strict evidence verification.
+- Employs rich deterministic syntactic and profile grounding when running offline or as fallback.
+- Never defaults to domain-specific assumptions (e.g., never assumes domain predicates or hardcoded companies).
+- Derives page subjects dynamically (e.g. dinosaur names, model names, company entities).
+- Verifies every fact against verbatim document text before acceptance.
+"""
 
 import os
 import re
 import json
-from pathlib import Path
-from typing import List, Dict, Any, Optional
 import logging
-
-from src.ingestion.pdf_loader import PDFPage
+from typing import List, Dict, Any, Optional, Set
 from src.facts.models import Fact, Evidence
+from src.ingestion.pdf_loader import PDFPage
 from src.facts.llm_provider import LLMProvider
+from src.facts.normalization import (
+    derive_document_subject,
+    derive_page_subject,
+    normalize_currency,
+    parse_numeric_and_scale,
+    extract_temporal_scope,
+    extract_context_scope,
+    fuzzy_verify_evidence,
+)
 
 logger = logging.getLogger(__name__)
 
-
 class FactExtractor:
-    """Extracts grounded facts from PDF pages."""
+    """Extracts grounded facts from arbitrary PDF documents without domain-specific assumptions."""
 
     def __init__(self, llm_provider: Optional[LLMProvider] = None):
         self.llm = llm_provider or LLMProvider()
+        self._llm_consecutive_failures = 0
 
     def extract_from_pages(self, pages: List[PDFPage]) -> List[Fact]:
         """Extract facts across a collection of pages."""
+        self._llm_consecutive_failures = 0
         all_facts: List[Fact] = []
         for page in pages:
             facts = self.extract_from_page(page)
@@ -29,560 +46,448 @@ class FactExtractor:
         return all_facts
 
     def extract_from_page(self, page: PDFPage) -> List[Fact]:
-        """Extract facts from a single page."""
-        facts: List[Fact] = []
+        """Extract facts from a single page with strict grounding and verification."""
         text = page.text
-        if not text:
-            return facts
+        if not text or len(text.strip()) < 10:
+            return []
 
-        deterministic_facts = self._extract_deterministic(page)
+        doc_name = page.document_name
+        p_num = page.page_number
+        page_subject = derive_page_subject(text, doc_name)
+        facts: List[Fact] = []
+
+        # 1. LLM Semantic Fact Extraction (if LLM backend is active and not circuit-broken)
+        llm_facts_extracted = False
+        if self.llm.is_active() and self._llm_consecutive_failures < 2 and len(text) > 80:
+            try:
+                llm_facts = self._extract_with_llm(page, page_subject)
+                if llm_facts:
+                    facts.extend(llm_facts)
+                    llm_facts_extracted = True
+                self._llm_consecutive_failures = 0
+            except Exception as e:
+                self._llm_consecutive_failures += 1
+                if self._llm_consecutive_failures >= 2:
+                    logger.info(f"LLM backend timed out or unavailable ({e}); proceeding with fast deterministic extraction.")
+                else:
+                    logger.warning(f"LLM fact extraction skipped on {doc_name} p.{p_num}: {e}")
+
+        # 2. Contextual Syntactic & Profile Fact Extraction (runs deterministic semantic discovery)
+        deterministic_facts = self._extract_contextual_facts(page, page_subject)
         facts.extend(deterministic_facts)
 
-        # LLM extraction during ingestion is disabled by default to keep document ingestion fast,
-        # offline, and avoid rate-limiting the provider. Gemini/OpenAI is strictly reserved for Ask Chat (RAG).
-        enable_llm_facts = os.getenv("ENABLE_LLM_FACT_EXTRACTION", "false").lower() == "true"
-        if enable_llm_facts and self.llm.provider_type in ["gemini", "openai", "ollama"] and len(text) > 100:
-            try:
-                llm_facts = self._extract_with_llm(page)
-                facts.extend(llm_facts)
-            except Exception as e:
-                logger.warning(f"LLM extraction failed on {page.document_name} p.{page.page_number}: {e}")
+        # 3. Deduplicate facts on the same page sharing identical attribute & normalized value
+        seen: Set[tuple] = set()
+        unique_facts: List[Fact] = []
+        for f in facts:
+            attr_key = re.sub(r'[^a-z0-9]', '', f.attribute.lower())[:24]
+            val_key = str(f.normalized_value) if f.normalized_value is not None else f.value.strip().lower()
+            subj_key = f.subject.strip().lower()[:20]
+            key = (subj_key, attr_key, val_key, f.temporal_scope or "", f.context_scope or "")
+            if key not in seen:
+                seen.add(key)
+                unique_facts.append(f)
 
-        return facts
+        return unique_facts
 
-    def _extract_deterministic(self, page: PDFPage) -> List[Fact]:
+    def _extract_with_llm(self, page: PDFPage, page_subject: str) -> List[Fact]:
+        """Extract semantic facts using structured LLM output with rigorous evidence validation."""
+        system_prompt = (
+            "You are a strict, domain-agnostic fact extraction system. "
+            "Extract verified factual claims (metrics, operational capacities, dates, percentages, measurements, key characteristics) "
+            "from the supplied text excerpt.\n"
+            "RULES:\n"
+            "1. Facts must come ONLY from the supplied text. Do NOT invent numbers, entities, or dates.\n"
+            "2. 'evidence_quote' MUST be an exact verbatim substring copied directly from the text.\n"
+            "3. If an entity/subject is not explicitly named, use the page or document subject.\n"
+            "4. Unknown scopes must be null.\n"
+            "5. Distinguish historical actuals, projections, and targets.\n"
+            "Return JSON adhering to this schema:\n"
+            "{\n"
+            '  "facts": [\n'
+            '    {\n'
+            '      "subject": "string",\n'
+            '      "attribute": "string",\n'
+            '      "value": "string",\n'
+            '      "unit": "string",\n'
+            '      "temporal_scope": "string or null",\n'
+            '      "context_scope": "string or null",\n'
+            '      "evidence_quote": "exact verbatim quote from text",\n'
+            '      "confidence": 0.95\n'
+            '    }\n'
+            '  ]\n'
+            "}"
+        )
+
+        user_prompt = (
+            f"Document: {page.document_name}, Page: {page.page_number}\n"
+            f"Text Excerpt:\n{page.text[:3000]}\n\n"
+            "Extract up to 6 high-importance, grounded facts with exact verbatim evidence quotes."
+        )
+
+        response_text = self.llm.generate(user_prompt, system_prompt=system_prompt, as_json=True)
+        if not response_text:
+            return []
+
+        try:
+            data = json.loads(response_text)
+        except Exception:
+            m = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if m:
+                data = json.loads(m.group(0))
+            else:
+                return []
+
+        verified_facts: List[Fact] = []
+        raw_items = data.get("facts", [])
+        for item in raw_items:
+            quote = (item.get("evidence_quote") or "").strip()
+            val = (item.get("value") or "").strip()
+            raw_attr = (item.get("attribute") or "").strip()
+            if not quote or not val or not raw_attr:
+                continue
+
+            # EVIDENCE VERIFICATION STAGE
+            is_verified, match_score = fuzzy_verify_evidence(quote, page.text)
+            if not is_verified:
+                continue
+
+            clean_val = re.sub(r'[^\d.]', '', val)
+            if clean_val and clean_val not in re.sub(r'[^\d.]', '', quote):
+                continue
+
+            norm_val, is_approx = parse_numeric_and_scale(val)
+            unit_str = (item.get("unit") or "").strip()
+            temp_scope = item.get("temporal_scope") or extract_temporal_scope(quote)
+            ctx_scope = item.get("context_scope") or extract_context_scope(quote)
+            subj = item.get("subject") or page_subject
+
+            attr = self._clean_attribute_name(raw_attr)
+            if len(attr) < 2:
+                continue
+
+            char_pos = page.text.find(quote)
+            verified_facts.append(Fact(
+                subject=subj,
+                attribute=attr,
+                value=val,
+                normalized_value=norm_val,
+                unit=unit_str or ("Count" if norm_val is not None else "Text"),
+                temporal_scope=temp_scope,
+                context_scope=ctx_scope,
+                evidence=Evidence(
+                    document_name=page.document_name,
+                    page_number=page.page_number,
+                    verbatim_quote=quote,
+                    char_offset=max(0, char_pos)
+                ),
+                confidence=min(0.96, match_score * float(item.get("confidence", 0.90)))
+            ))
+
+        return verified_facts
+
+    def _extract_contextual_facts(self, page: PDFPage, page_subject: str) -> List[Fact]:
+        """Extract facts using deterministic syntactic and profile grounding."""
         facts: List[Fact] = []
         text = page.text
         doc = page.document_name
         p_num = page.page_number
 
-        rev_standalone_match = re.search(
-            r'revenue from operations on standalone basis for (FY\d{2})\s+stood at\s*[₹Rs\.]*\s*([\d,]+\.?\d*)\s*(million|crore|cr)?',
-            text, re.IGNORECASE
-        )
-        if rev_standalone_match:
-            period = rev_standalone_match.group(1).upper()
-            val_str = rev_standalone_match.group(2)
-            unit_str = rev_standalone_match.group(3) or "million"
-            norm_val = self._normalize_currency(val_str, unit_str)
-            snippet = self._find_surrounding_sentence(text, rev_standalone_match.start())
+        # --- A. Structured & Unstructured Key-Value Profile Items ---
+        # Matches both single-line ('Height: 16 feet') and multi-line ('Height:\n16 feet')
+        # Handles dimensional measurements, dates, and qualitative attributes
+        kv_pattern = r'(?m)^([A-Za-z0-9][a-zA-Z0-9\s/&-]{1,32}?):\s*(?:\n\s*)?([^\n\r]{1,90})'
+        for m in re.finditer(kv_pattern, text):
+            raw_key = re.sub(r'^(?:FACT FILE|PROFILE|OVERVIEW|SPECIFICATIONS|SUMMARY)\s*', '', m.group(1), flags=re.IGNORECASE).strip()
+            raw_val = m.group(2).strip()
+
+            if len(raw_key) < 2 or any(w in raw_key.lower() for w in ["http", "www", "page", "chapter", "section", "table of contents", "did you know", "click here", "contents"]):
+                continue
+            if not raw_val or len(raw_val) < 1 or "..." in raw_val:
+                continue
+
+            attr = self._clean_attribute_name(raw_key)
+            if len(attr) < 2:
+                continue
+
+            # Detect measurement units in value e.g. "16 feet", "6 tons", "33 lbs", "1 lb 1.67 oz", "94.6%"
+            m_unit = re.search(r'([\d,]+\.?\d*)\s*(feet|foot|ft|inches|inch|in|meters|metres|m|cm|mm|miles|km|tons|tonnes|ton|lbs|lb|pounds|pound|ounces|oz|kg|mg|g|mya|million years|years ago|mph|km/h|req/s|rps|nodes|ms|%)\b', raw_val, re.IGNORECASE)
+            if m_unit:
+                norm_val, _ = parse_numeric_and_scale(m_unit.group(1))
+                unit_str = m_unit.group(2).title()
+            else:
+                m_num = re.search(r'(-?[\d,]+\.?\d*)', raw_val)
+                if m_num and len(raw_val) <= 25:
+                    norm_val, _ = parse_numeric_and_scale(m_num.group(1))
+                    unit_str = "Count" if "year" not in attr.lower() else "Year"
+                else:
+                    norm_val = None
+                    unit_str = "Text"
+
+            match_text = m.group(0).strip()
+            char_pos = text.find(match_text)
+
             facts.append(Fact(
-                subject="Delhivery Limited",
-                attribute="Revenue from Operations",
-                value=f"₹ {val_str} {unit_str}",
+                subject=page_subject,
+                attribute=attr,
+                value=raw_val,
                 normalized_value=norm_val,
-                unit="INR",
-                temporal_scope=period,
-                context_scope="Standalone",
+                unit=unit_str,
+                temporal_scope=extract_temporal_scope(raw_val) or extract_temporal_scope(match_text),
+                context_scope=extract_context_scope(raw_val) or extract_context_scope(match_text),
                 evidence=Evidence(
                     document_name=doc,
                     page_number=p_num,
-                    verbatim_quote=snippet,
-                    char_offset=rev_standalone_match.start()
+                    verbatim_quote=match_text,
+                    char_offset=max(0, char_pos)
                 ),
-                confidence=0.98
+                confidence=0.95
             ))
 
-        rev_consol_match = re.search(
-            r'revenue from operations on consolidated basis for\s*(FY\d{2})\s+stood at\s*[₹Rs\.]*\s*([\d,]+\.?\d*)\s*(million|crore|cr)?',
-            text, re.IGNORECASE
-        )
-        if rev_consol_match:
-            period = rev_consol_match.group(1).upper()
-            val_str = rev_consol_match.group(2)
-            unit_str = rev_consol_match.group(3) or "million"
-            norm_val = self._normalize_currency(val_str, unit_str)
-            snippet = self._find_surrounding_sentence(text, rev_consol_match.start())
-            facts.append(Fact(
-                subject="Delhivery Limited",
-                attribute="Revenue from Operations",
-                value=f"₹ {val_str} {unit_str}",
-                normalized_value=norm_val,
-                unit="INR",
-                temporal_scope=period,
-                context_scope="Consolidated",
-                evidence=Evidence(
-                    document_name=doc,
-                    page_number=p_num,
-                    verbatim_quote=snippet,
-                    char_offset=rev_consol_match.start()
-                ),
-                confidence=0.98
-            ))
+        # --- B. Sentence-Level Clause Analysis ---
+        sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text.replace("\r", " ")) if len(s.strip()) > 15]
 
-        if "presentation" in doc.lower():
-            pres_rev_match = re.search(r'[₹Rs\.]*\s*(8,142|7,224|7,225)\s*(?:Cr)?', text)
-            if pres_rev_match and any(w in text.lower() for w in ["revenue", "fy24", "fy23", "financial highlights"]):
-                val_str = pres_rev_match.group(1)
-                period = "FY24" if val_str == "8,142" else "FY23"
-                norm_val = float(val_str.replace(",", "")) * 10_000_000
-                snippet = self._find_surrounding_sentence(text, pres_rev_match.start())
+        for sentence in sentences:
+            temporal_scope = extract_temporal_scope(sentence)
+            context_scope = extract_context_scope(sentence)
+
+            # --- Pattern Family 1: Currencies with Explicit Symbols & Scales ---
+            # Strictly requires explicit currency symbol/code AND at least one digit
+            curr_matches = re.finditer(
+                r'([A-Za-z][a-zA-Z\s/&]{2,45}?)\s*(?:was|is|reached|stood at|amounted to|totaled|totalled|of|at)\s+(?:\$|€|£|¥|₹|\bUSD\b|\bEUR\b|\bINR\b|\bGBP\b|\bJPY\b|\bRs\.\s*|\bRs\s+)\s*([\d,]+\.?\d*)\s*(trillion|billion|million|crore|cr|lakh|thousand|[kKmMbB])?\b',
+                sentence, re.IGNORECASE
+            )
+            for m in curr_matches:
+                raw_attr = m.group(1)
+                val_num = m.group(2)
+                scale_str = m.group(3) or ""
+
+                attr = self._clean_attribute_name(raw_attr)
+                if len(attr) < 3 or any(w in attr.lower() for w in ["page", "chapter", "section", "table", "figure", "http"]):
+                    continue
+
+                norm_val, _ = parse_numeric_and_scale(val_num, scale_str)
+                sym_match = re.search(r'(\$|€|£|¥|₹|\bUSD\b|\bEUR\b|\bINR\b|\bGBP\b|\bJPY\b|\bRs\.?)', m.group(0), re.IGNORECASE)
+                sym = sym_match.group(1) if sym_match else "USD"
+                val_repr = f"{sym} {val_num} {scale_str}".strip()
+
+                char_pos = text.find(sentence)
                 facts.append(Fact(
-                    subject="Delhivery Limited",
-                    attribute="Revenue from Operations",
-                    value=f"₹{val_str} Cr",
+                    subject=page_subject,
+                    attribute=attr,
+                    value=val_repr,
                     normalized_value=norm_val,
-                    unit="INR",
-                    temporal_scope=period,
-                    context_scope="Consolidated",
+                    unit=normalize_currency(sym),
+                    temporal_scope=temporal_scope,
+                    context_scope=context_scope,
                     evidence=Evidence(
                         document_name=doc,
                         page_number=p_num,
-                        verbatim_quote=snippet,
-                        char_offset=pres_rev_match.start()
+                        verbatim_quote=sentence,
+                        char_offset=max(0, char_pos)
+                    ),
+                    confidence=0.96
+                ))
+
+            # --- Pattern Family 2: Percentages & Rates with Grounded Subject ---
+            pct_matches = re.finditer(
+                r'([A-Za-z][a-zA-Z\s/&]{2,45}?)\s*(?:of|is|was|were|reached|at|in|by|achieved|moderated to|grew by|expanded by|declined by|decreased to|increased to|stood at|averaged)\s+(-?[\d\.]+)\s*(?:%|per\s*cent)(?:\s+([A-Za-z]{2,20}))?',
+                sentence, re.IGNORECASE
+            )
+            for m in pct_matches:
+                raw_attr = m.group(1)
+                val_str = m.group(2)
+                post_noun = (m.group(3) or "").strip()
+
+                if post_noun and post_noun.lower() not in ["across", "during", "in", "for", "on", "of", "and", "the", "with"]:
+                    attr = self._clean_attribute_name(post_noun)
+                else:
+                    attr = self._clean_attribute_name(raw_attr)
+
+                if len(attr) < 3 or any(w in attr.lower() for w in ["page", "chapter", "section", "table", "figure"]):
+                    continue
+
+                try:
+                    norm_val = float(val_str)
+                except ValueError:
+                    norm_val = None
+
+                char_pos = text.find(sentence)
+                facts.append(Fact(
+                    subject=page_subject,
+                    attribute=attr,
+                    value=f"{val_str}%",
+                    normalized_value=norm_val,
+                    unit="Percentage",
+                    temporal_scope=temporal_scope,
+                    context_scope=context_scope,
+                    evidence=Evidence(
+                        document_name=doc,
+                        page_number=p_num,
+                        verbatim_quote=sentence,
+                        char_offset=max(0, char_pos)
                     ),
                     confidence=0.95
                 ))
 
-        pin_prospectus = re.search(
-            r'serviced\s+([\d,]+)\s+PIN\s+codes\s+(?:during|for)\s+the\s+nine\s+months\s+period\s+ended\s+December\s+31,\s*2021',
-            text, re.IGNORECASE
-        )
-        if pin_prospectus:
-            val_str = pin_prospectus.group(1)
-            norm_val = float(val_str.replace(",", ""))
-            snippet = self._find_surrounding_sentence(text, pin_prospectus.start())
-            facts.append(Fact(
-                subject="Delhivery Network",
-                attribute="PIN Codes Covered",
-                value=f"{val_str} PIN codes",
-                normalized_value=norm_val,
-                unit="Count",
-                temporal_scope="As of December 31, 2021",
-                context_scope="Express Parcel Network",
-                evidence=Evidence(
-                    document_name=doc,
-                    page_number=p_num,
-                    verbatim_quote=snippet,
-                    char_offset=pin_prospectus.start()
-                ),
-                confidence=0.97
-            ))
+            # --- Pattern Family 3: Physical, Technical, and Dimensional Units ---
+            # e.g., "latency fell to 12.5 ms", "wingspan over 2 feet", "sample temperature was 37.2 °C"
+            # e.g., "processed 2.3 million requests", "sustained 45,000 nodes"
+            unit_matches = re.finditer(
+                r'([A-Za-z][a-zA-Z\s/&]{2,45}?)\s*(?:of|is|was|were|at|in|by|has|had|stood at|reached|deployed|handled|processed|sustained|used|recorded at|measured at|decreased to|increased to|improved to|fell to|rose to|dropped to|capacity of|with a wingspan of|wingspan over)\s+(?:over\s+|nearly\s+)?([\d,]+\.?\d*)\s*(million|billion|crore|cr|lakh|thousand|[kKmMbB])?\s*(feet|foot|ft|inches|inch|in|meters|metres|m|cm|mm|miles|km|yards|tons|tonnes|ton|lbs|lb|pounds|pound|ounces|oz|kg|mg|g|mcg|ml|l|mya|million years|years ago|mph|km/h|kph|m/s|°c|°f|celsius|fahrenheit|hz|khz|mhz|ghz|kb|mb|gb|tb|ms|milliseconds|seconds|minutes|hours|days|weeks|months|years|nodes|parameters|tokens|requests|req/s|rps|users|customers|clients|shipments|units|stores|branches|facilities|subjects|patients|cases|participants|samples|trials|events)\b',
+                sentence, re.IGNORECASE
+            )
+            for m in unit_matches:
+                raw_attr = m.group(1)
+                val_str = m.group(2)
+                scale_str = m.group(3) or ""
+                unit_str = m.group(4)
 
-        pin_ar = re.search(
-            r'services\s+in\s+([\d,]+)\s+postal\s+index\s+number\s+.*?codes.*?(?:as\s+of\s+March\s+31,\s*2024)?',
-            text, re.IGNORECASE
-        )
-        if pin_ar:
-            val_str = pin_ar.group(1)
-            norm_val = float(val_str.replace(",", ""))
-            snippet = self._find_surrounding_sentence(text, pin_ar.start())
-            facts.append(Fact(
-                subject="Delhivery Network",
-                attribute="PIN Codes Covered",
-                value=f"{val_str} PIN codes",
-                normalized_value=norm_val,
-                unit="Count",
-                temporal_scope="As of March 31, 2024",
-                context_scope="Pan-India Network",
-                evidence=Evidence(
-                    document_name=doc,
-                    page_number=p_num,
-                    verbatim_quote=snippet,
-                    char_offset=pin_ar.start()
-                ),
-                confidence=0.98
-            ))
+                cleaned_raw = self._clean_attribute_name(raw_attr)
+                if cleaned_raw.lower() in ["system", "platform", "model", "we", "firm", "company", "experiment", "study"]:
+                    attr = f"{unit_str.title()} Processed"
+                else:
+                    attr = cleaned_raw
 
-        total_pin_match = re.search(r'([\d,]+)\s+(?:PIN|pin)\s+codes\s+in\s+India', text, re.IGNORECASE)
-        if total_pin_match:
-            val_str = total_pin_match.group(1)
-            if "19,300" in val_str or "19300" in val_str:
-                snippet = self._find_surrounding_sentence(text, total_pin_match.start())
+                if len(attr) < 3 or any(w in attr.lower() for w in ["page", "chapter", "section", "table", "figure"]):
+                    continue
+
+                norm_val, _ = parse_numeric_and_scale(val_str, scale_str)
+                full_val = f"{val_str} {scale_str} {unit_str}".replace("  ", " ").strip()
+
+                char_pos = text.find(sentence)
                 facts.append(Fact(
-                    subject="Postal System in India",
-                    attribute="Total PIN Codes in India",
-                    value=f"{val_str} PIN codes",
-                    normalized_value=19300.0,
-                    unit="Count",
-                    temporal_scope="Reference Standard",
-                    context_scope="India Post Baseline",
+                    subject=page_subject,
+                    attribute=attr,
+                    value=full_val,
+                    normalized_value=norm_val,
+                    unit=unit_str.title(),
+                    temporal_scope=temporal_scope,
+                    context_scope=context_scope,
                     evidence=Evidence(
                         document_name=doc,
                         page_number=p_num,
-                        verbatim_quote=snippet,
-                        char_offset=total_pin_match.start()
+                        verbatim_quote=sentence,
+                        char_offset=max(0, char_pos)
                     ),
-                    confidence=0.99
+                    confidence=0.94
                 ))
 
-        cust_match = re.search(r'diverse\s+base\s+of\s+over\s+([\d,]+)\s+active\s+customers', text, re.IGNORECASE)
-        if cust_match:
-            val_str = cust_match.group(1)
-            norm_val = float(val_str.replace(",", ""))
-            snippet = self._find_surrounding_sentence(text, cust_match.start())
-            facts.append(Fact(
-                subject="Delhivery Limited",
-                attribute="Active Customer Count",
-                value=f"Over {val_str} active customers",
-                normalized_value=norm_val,
-                unit="Count",
-                temporal_scope="As of March 31, 2024",
-                context_scope="Enterprise & SME Clients",
-                evidence=Evidence(
-                    document_name=doc,
-                    page_number=p_num,
-                    verbatim_quote=snippet,
-                    char_offset=cust_match.start()
-                ),
-                confidence=0.96
-            ))
+            # --- Pattern Family 4: Historical, Discovery, and Founding Milestones ---
+            # e.g., "T-rex was first discovered by Barnum Brown in 1902", "founded in 1990", "coined in 1842"
+            disc_match = re.search(
+                r'([A-Z][a-zA-Z\s\'-]{2,30}?)\s+(?:was\s+first\s+discovered|was\s+discovered|was\s+first\s+described|was\s+first\s+coined|was\s+coined|was\s+founded|was\s+established|since\s+its\s+beginnings\s+in)\s+(?:by\s+[A-Za-z\s]+)?\s*(?:in|on)?\s*(\d{4})\b',
+                sentence, re.IGNORECASE
+            )
+            if disc_match:
+                subj_cand = disc_match.group(1).strip()
+                yr = disc_match.group(2).strip()
+                subj = subj_cand if len(subj_cand) >= 3 and not any(w in subj_cand.lower() for w in ["it", "this", "that", "there"]) else page_subject
 
-        sort_match = re.search(r'Rated\s+Automated\s+Sort\s+Capacity\s+of\s+([\d\.]+)\s+million\s+shipments\s+per\s+day', text, re.IGNORECASE)
-        if sort_match:
-            val_str = sort_match.group(1)
-            norm_val = float(val_str) * 1_000_000
-            snippet = self._find_surrounding_sentence(text, sort_match.start())
-            facts.append(Fact(
-                subject="Delhivery Network Infrastructure",
-                attribute="Rated Automated Sort Capacity",
-                value=f"{val_str} million shipments/day",
-                normalized_value=norm_val,
-                unit="Shipments/Day",
-                temporal_scope="As of March 31, 2024",
-                context_scope="Automated Sortation Centers",
-                evidence=Evidence(
-                    document_name=doc,
-                    page_number=p_num,
-                    verbatim_quote=snippet,
-                    char_offset=sort_match.start()
-                ),
-                confidence=0.98
-            ))
+                char_pos = text.find(sentence)
+                facts.append(Fact(
+                    subject=subj,
+                    attribute="Historical Milestone",
+                    value=yr,
+                    normalized_value=float(yr),
+                    unit="Year",
+                    temporal_scope=yr,
+                    context_scope="Historical",
+                    evidence=Evidence(
+                        document_name=doc,
+                        page_number=p_num,
+                        verbatim_quote=sentence,
+                        char_offset=max(0, char_pos)
+                    ),
+                    confidence=0.93
+                ))
 
-        # 1. Real GDP Growth Rate (Actuals)
-        gdp_actual = re.search(
-            r'(?:real\s+(?:gross\s+domestic\s+product\s*\(GDP\)\d*|GDP)\s+growth|economic\s+growth|real\s+GDP\s+grew)\s*(?:moderated\s+to|grew\s+by|expanded\s+by|stood\s+at|of)\s+([\d\.]+)\s*(?:per\s*cent|%)',
-            text, re.IGNORECASE
-        )
-        if gdp_actual:
-            val_str = gdp_actual.group(1)
-            norm_val = float(val_str)
-            period = "FY 2024-25" if ("2024-25" in text or "FY2024/25" in text or "FY24" in text) else "Current Fiscal"
-            snippet = self._find_surrounding_sentence(text, gdp_actual.start())
-            facts.append(Fact(
-                subject="Indian Economy",
-                attribute="Real GDP Growth Rate",
-                value=f"{val_str}%",
-                normalized_value=norm_val,
-                unit="Percentage",
-                temporal_scope=period,
-                context_scope="Official Statistics",
-                evidence=Evidence(
-                    document_name=doc,
-                    page_number=p_num,
-                    verbatim_quote=snippet,
-                    char_offset=gdp_actual.start()
-                ),
-                confidence=0.98
-            ))
+            # --- Pattern Family 5: Classifications, Types, and Categories ---
+            # e.g., "Triceratops is classified as a cerapod", "Diplodocus falls in the Sauropod category"
+            cat_match = re.search(
+                r'([A-Z][a-zA-Z\s\'-]{2,30}?)\s+(?:is|was)\s+(?:classified as|a type of|a category of|a member of)\s+(?:a|an)?\s*([a-zA-Z\s-]{3,35}?)(?:\b|[.,;])',
+                sentence, re.IGNORECASE
+            )
+            if cat_match:
+                subj_cand = cat_match.group(1).strip()
+                cat_val = cat_match.group(2).strip().title()
+                subj = subj_cand if len(subj_cand) >= 3 and not any(w in subj_cand.lower() for w in ["it", "this", "that"]) else page_subject
 
-        # 2. Headline Inflation
-        headline_inf = re.search(
-            r'headline\s+(?:CPI\s+)?inflation.*?(?:averaged|stood\s+at|was|of)\s+([\d\.]+)\s*(?:per\s*cent|%)',
-            text, re.IGNORECASE
-        )
-        if headline_inf:
-            val_str = headline_inf.group(1)
-            norm_val = float(val_str)
-            period = "FY 2024-25" if ("2024-25" in text or "FY2024/25" in text) else "Annual Average"
-            snippet = self._find_surrounding_sentence(text, headline_inf.start())
-            facts.append(Fact(
-                subject="Indian Economy",
-                attribute="Headline CPI Inflation",
-                value=f"{val_str}%",
-                normalized_value=norm_val,
-                unit="Percentage",
-                temporal_scope=period,
-                context_scope="Headline CPI Basket (All Items)",
-                evidence=Evidence(
-                    document_name=doc,
-                    page_number=p_num,
-                    verbatim_quote=snippet,
-                    char_offset=headline_inf.start()
-                ),
-                confidence=0.97
-            ))
+                char_pos = text.find(sentence)
+                facts.append(Fact(
+                    subject=subj,
+                    attribute="Classification",
+                    value=cat_val,
+                    normalized_value=None,
+                    unit="Category",
+                    temporal_scope=temporal_scope,
+                    context_scope=context_scope,
+                    evidence=Evidence(
+                        document_name=doc,
+                        page_number=p_num,
+                        verbatim_quote=sentence,
+                        char_offset=max(0, char_pos)
+                    ),
+                    confidence=0.93
+                ))
 
-        # 3. Core Inflation
-        core_inf = re.search(
-            r'core\s+inflation.*?(?:increased\s+to|stood\s+at|was|of)\s+([\d\.]+)\s*(?:per\s*cent|%)',
-            text, re.IGNORECASE
-        )
-        if core_inf:
-            val_str = core_inf.group(1)
-            norm_val = float(val_str)
-            period = "FY 2024-25" if ("2024-25" in text or "FY2024/25" in text) else "FY25 Benchmark"
-            snippet = self._find_surrounding_sentence(text, core_inf.start())
-            facts.append(Fact(
-                subject="Indian Economy",
-                attribute="Core CPI Inflation",
-                value=f"{val_str}%",
-                normalized_value=norm_val,
-                unit="Percentage",
-                temporal_scope=period,
-                context_scope="Core Basket (Excluding Food and Fuel)",
-                evidence=Evidence(
-                    document_name=doc,
-                    page_number=p_num,
-                    verbatim_quote=snippet,
-                    char_offset=core_inf.start()
-                ),
-                confidence=0.97
-            ))
+        # --- Pattern Family 6: Structured Table Cell Observations ---
+        for table in page.tables:
+            if not table or len(table) < 2:
+                continue
+            header_row = table[0]
+            for r_idx, row in enumerate(table[1:], start=2):
+                if not row or len(row) < 2:
+                    continue
+                row_label = row[0].strip()
+                if not row_label or len(row_label) < 2:
+                    continue
+                attr = self._clean_attribute_name(row_label)
+                if len(attr) < 3 or any(w in attr.lower() for w in ["total", "sl no", "sr no"]):
+                    continue
 
-        # 4. Projected Real GDP Growth (RBI & IMF)
-        gdp_proj = re.search(
-            r'(?:real\s+GDP\s+growth|growth).*?(?:is\s+projected\s+at|projected\s+to\s+be|forecast\s+at|placed\s+at)\s+([\d\.]+)\s*(?:per\s*cent|%)',
-            text, re.IGNORECASE
-        )
-        if gdp_proj:
-            val_str = gdp_proj.group(1)
-            norm_val = float(val_str)
-            period = "FY 2025-26" if ("2025-26" in text or "FY2025/26" in text) else "Forecast Horizon"
-            scope = "IMF Staff Projection" if "imf" in doc.lower() else "RBI Baseline Projection"
-            snippet = self._find_surrounding_sentence(text, gdp_proj.start())
-            facts.append(Fact(
-                subject="Indian Economy",
-                attribute="Projected Real GDP Growth",
-                value=f"{val_str}%",
-                normalized_value=norm_val,
-                unit="Percentage",
-                temporal_scope=period,
-                context_scope=scope,
-                evidence=Evidence(
-                    document_name=doc,
-                    page_number=p_num,
-                    verbatim_quote=snippet,
-                    char_offset=gdp_proj.start()
-                ),
-                confidence=0.96
-            ))
+                for col_idx, cell_val in enumerate(row[1:], start=1):
+                    cell_val = cell_val.strip()
+                    if not cell_val:
+                        continue
+                    num_match = re.search(r'(-?[\d,]+\.?\d*)', cell_val)
+                    if not num_match:
+                        continue
+                    col_header = header_row[col_idx].strip() if col_idx < len(header_row) else ""
+                    table_time = extract_temporal_scope(col_header) or extract_temporal_scope(row_label)
+                    table_scope = extract_context_scope(col_header) or extract_context_scope(row_label)
 
-        # 5. Gross Fiscal Deficit
-        fiscal_def = re.search(
-            r'(?:gross\s+)?fiscal\s+deficit.*?(?:stood\s+at|was|placed\s+at|moderated\s+to)\s+([\d\.]+)\s*(?:per\s*cent|%)\s+of\s+GDP',
-            text, re.IGNORECASE
-        )
-        if fiscal_def:
-            val_str = fiscal_def.group(1)
-            norm_val = float(val_str)
-            period = "FY 2024-25 (BE)" if "BE" in text else "FY 2024-25"
-            snippet = self._find_surrounding_sentence(text, fiscal_def.start())
-            facts.append(Fact(
-                subject="Indian Economy",
-                attribute="Gross Fiscal Deficit",
-                value=f"{val_str}% of GDP",
-                normalized_value=norm_val,
-                unit="Percentage of GDP",
-                temporal_scope=period,
-                context_scope="Union Budget Baseline",
-                evidence=Evidence(
-                    document_name=doc,
-                    page_number=p_num,
-                    verbatim_quote=snippet,
-                    char_offset=fiscal_def.start()
-                ),
-                confidence=0.97
-            ))
-
-        generic_facts = self._extract_generic_observations(page)
-        facts.extend(generic_facts)
+                    norm_val, _ = parse_numeric_and_scale(num_match.group(1))
+                    quote = f"{row_label} | {col_header}: {cell_val}"
+                    facts.append(Fact(
+                        subject=page_subject,
+                        attribute=attr,
+                        value=cell_val,
+                        normalized_value=norm_val,
+                        unit=col_header if len(col_header) < 20 else "Table Metric",
+                        temporal_scope=table_time,
+                        context_scope=table_scope,
+                        evidence=Evidence(
+                            document_name=doc,
+                            page_number=p_num,
+                            verbatim_quote=quote,
+                            table_citation=f"Table on page {p_num}, Row '{row_label}'"
+                        ),
+                        confidence=0.92
+                    ))
 
         return facts
 
-    def _extract_generic_observations(self, page: PDFPage) -> List[Fact]:
-        """Extract generic numerical, percentage, and metric facts from any document."""
-        facts: List[Fact] = []
-        text = page.text
-        doc = page.document_name
-        doc_stem = Path(doc).stem.replace("-", " ").replace("_", " ").title()
-        p_num = page.page_number
-
-        # 1. Generic currency amounts: e.g. "$45.2 million", "€120B", "£5,000"
-        curr_matches = re.finditer(
-            r'(?:([A-Z][a-zA-Z\s]{2,25})\s+(?:was|is|of|reached|stood at|totaled)\s+)?([\$€£₹]|USD|EUR|INR|Rs\.?)\s*([\d,]+\.?\d*)\s*(trillion|billion|million|crore|cr|thousand)?',
-            text, re.IGNORECASE
-        )
-        for m in curr_matches:
-            attr = (m.group(1) or "Financial Metric").strip()
-            sym = m.group(2)
-            val_str = m.group(3)
-            scale = m.group(4) or ""
-            if len(val_str) < 1 or val_str == "0":
-                continue
-
-            try:
-                norm_val = self._normalize_currency(val_str, scale)
-            except Exception:
-                norm_val = None
-
-            full_val = f"{sym}{val_str} {scale}".strip()
-            snippet = self._find_surrounding_sentence(text, m.start())
-            facts.append(Fact(
-                subject=doc_stem,
-                attribute=attr.title(),
-                value=full_val,
-                normalized_value=norm_val,
-                unit=sym,
-                evidence=Evidence(
-                    document_name=doc,
-                    page_number=p_num,
-                    verbatim_quote=snippet,
-                    char_offset=m.start()
-                ),
-                confidence=0.88
-            ))
-
-        # 2. Percentage and rate metrics: e.g. "accuracy of 94.6%", "growth rate of 12.5%"
-        pct_matches = re.finditer(
-            r'([A-Za-z][A-Za-z\s]{2,30})\s+(?:of|is|was|reached|at|by|achieved)\s+([\d\.]+)%',
-            text
-        )
-        for m in pct_matches:
-            attr = m.group(1).strip()
-            attr = re.sub(r'^(?:and|or|we|the|a|an|in|with|of|have|achieved|evaluated|measured)\s+', '', attr, flags=re.IGNORECASE).strip()
-            val_str = m.group(2)
-            if any(w in attr.lower() for w in ["page", "chapter", "section", "figure", "table"]):
-                continue
-
-            try:
-                norm_val = float(val_str)
-            except Exception:
-                norm_val = None
-
-            snippet = self._find_surrounding_sentence(text, m.start())
-            facts.append(Fact(
-                subject=doc_stem,
-                attribute=attr.title(),
-                value=f"{val_str}%",
-                normalized_value=norm_val,
-                unit="Percentage",
-                evidence=Evidence(
-                    document_name=doc,
-                    page_number=p_num,
-                    verbatim_quote=snippet,
-                    char_offset=m.start()
-                ),
-                confidence=0.90
-            ))
-
-        # 3. Numeric metrics with units: e.g. "latency of 14.2 ms", "65 million parameters"
-        metric_matches = re.finditer(
-            r'([A-Za-z][A-Za-z\s]{2,25})\s+(?:of|is|was|at|by|has|stood at)\s+([\d,]+\.?\d*)\s*(ms|seconds|minutes|hours|days|parameters|layers|tokens|queries|requests|GB|MB|KB|kW|MW)',
-            text, re.IGNORECASE
-        )
-        for m in metric_matches:
-            attr = m.group(1).strip()
-            attr = re.sub(r'^(?:and|or|we|the|a|an|in|with|of|have|achieved|evaluated|measured)\s+', '', attr, flags=re.IGNORECASE).strip()
-            val_str = m.group(2)
-            unit_str = m.group(3)
-            if any(w in attr.lower() for w in ["page", "chapter", "section"]):
-                continue
-
-            try:
-                norm_val = float(val_str.replace(",", ""))
-            except Exception:
-                norm_val = None
-
-            snippet = self._find_surrounding_sentence(text, m.start())
-            facts.append(Fact(
-                subject=doc_stem,
-                attribute=attr.title(),
-                value=f"{val_str} {unit_str}",
-                normalized_value=norm_val,
-                unit=unit_str,
-                evidence=Evidence(
-                    document_name=doc,
-                    page_number=p_num,
-                    verbatim_quote=snippet,
-                    char_offset=m.start()
-                ),
-                confidence=0.89
-            ))
-
-        # 4. Tables on this page: extract structured tabular observations
-        if hasattr(page, 'tables') and page.tables:
-            for grid in page.tables:
-                if len(grid) >= 2:
-                    headers = [str(c or "").strip() for c in grid[0]]
-                    for row in grid[1:6]:
-                        row_label = str(row[0] or "").strip() if len(row) > 0 else ""
-                        if not row_label or len(row_label) > 60:
-                            continue
-                        for col_idx, cell in enumerate(row[1:], start=1):
-                            cell_val = str(cell or "").strip()
-                            if re.match(r'^-?[\$€£₹]?\s*[\d,]+\.?\d*[%a-zA-Z]*$', cell_val):
-                                col_name = headers[col_idx] if col_idx < len(headers) else f"Col {col_idx}"
-                                facts.append(Fact(
-                                    subject=doc_stem,
-                                    attribute=f"{row_label} ({col_name})",
-                                    value=cell_val,
-                                    evidence=Evidence(
-                                        document_name=doc,
-                                        page_number=p_num,
-                                        verbatim_quote=f"Table: {row_label} | {col_name}: {cell_val}"
-                                    ),
-                                    confidence=0.92
-                                ))
-
-        # Deduplicate facts on same attribute
-        seen_attrs = set()
-        unique_facts = []
-        for f in facts:
-            key = (f.attribute.lower(), f.value)
-            if key not in seen_attrs:
-                seen_attrs.add(key)
-                unique_facts.append(f)
-
-        return unique_facts[:15]
-
-    def _extract_with_llm(self, page: PDFPage) -> List[Fact]:
-        system_prompt = (
-            "You are an expert financial and corporate facts extractor. "
-            "Extract structured facts with exact verbatim quotes as evidence. "
-            "Return JSON: {\"facts\": [{\"subject\": \"...\", \"attribute\": \"...\", \"value\": \"...\", "
-            "\"unit\": \"...\", \"temporal_scope\": \"...\", \"context_scope\": \"...\", \"verbatim_quote\": \"...\"}]}"
-        )
-        user_prompt = (
-            f"Document: {page.document_name}, Page: {page.page_number}\n"
-            f"Text Excerpt:\n{page.text[:2500]}\n\n"
-            "Extract up to 3 high-importance facts."
-        )
-
-        response_text = self.llm.generate(user_prompt, system_prompt=system_prompt)
-        data = json.loads(response_text)
-        facts = []
-        for item in data.get("facts", []):
-            facts.append(Fact(
-                subject=item.get("subject", "Unknown"),
-                attribute=item.get("attribute", "General Metric"),
-                value=item.get("value", ""),
-                unit=item.get("unit", ""),
-                temporal_scope=item.get("temporal_scope"),
-                context_scope=item.get("context_scope"),
-                evidence=Evidence(
-                    document_name=page.document_name,
-                    page_number=page.page_number,
-                    verbatim_quote=item.get("verbatim_quote", "")
-                ),
-                confidence=0.90
-            ))
-        return facts
-
-    def _normalize_currency(self, val_str: str, unit: str) -> float:
-        num = float(val_str.replace(",", ""))
-        unit_lower = unit.lower()
-        if "million" in unit_lower:
-            return num * 1_000_000
-        elif "crore" in unit_lower or "cr" in unit_lower:
-            return num * 10_000_000
-        elif "billion" in unit_lower:
-            return num * 1_000_000_000
-        return num
-
-    def _find_surrounding_sentence(self, text: str, match_pos: int, window: int = 250) -> str:
-        start = max(0, match_pos - 80)
-        end = min(len(text), match_pos + window)
-        snippet = text[start:end].replace("\n", " ").strip()
-        return re.sub(r'\s+', ' ', snippet)
+    def _clean_attribute_name(self, raw_attr: str) -> str:
+        """Sanitize attribute string to produce clean, canonical metric titles."""
+        attr = raw_attr.strip()
+        # Remove temporal phrases
+        attr = re.sub(r'\b(?:for\s+FY\s*\d{2,4}|for\s+the\s+fiscal\s+year\s+ended\s+[A-Za-z0-9,\s]+|in\s+FY\s*\d{2,4}|in\s+\d{4}(?:-\d{2,4})?|for\s+\d{4}(?:-\d{2,4})?)\b', '', attr, flags=re.IGNORECASE)
+        # Remove scope phrases (since scope is captured independently in context_scope)
+        attr = re.sub(r'\b(?:on\s+standalone\s+basis|on\s+consolidated\s+basis|consolidated|standalone)\b', '', attr, flags=re.IGNORECASE)
+        # Remove leading conjunctions or filler words
+        attr = re.sub(r'^(?:and|or|in|with|the|a|an|its|our|reaching an|reaching|company|firm|we|observed|measured|total)\s+', '', attr, flags=re.IGNORECASE)
+        # Remove trailing prepositions
+        attr = re.sub(r'\s+(?:for|in|on|at|of|during|as\s+of|was|is|were|stood\s+at)\s*$', '', attr, flags=re.IGNORECASE)
+        cleaned = re.sub(r'\s+', ' ', attr).strip().title()
+        return cleaned

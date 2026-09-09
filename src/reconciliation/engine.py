@@ -1,41 +1,53 @@
-"""Cross-document and intra-document fact reconciliation engine."""
+"""Domain-agnostic fact reconciliation and comparability engine.
 
-import re
-from typing import List, Dict, Tuple, Optional
-from collections import defaultdict
+Evaluates pairs of verified facts across documents and sections using an explicit
+multi-dimensional comparability decision matrix:
+- Entity comparability (MATCH, ALIAS, DIFFERENT, UNKNOWN)
+- Predicate comparability (MATCH, SIMILAR, DIFFERENT)
+- Unit compatibility (COMPATIBLE, INCOMPATIBLE, UNKNOWN)
+- Temporal compatibility (SAME, DIFFERENT, UNKNOWN)
+- Contextual scope compatibility (SAME, DIFFERENT, UNKNOWN)
+- Value comparison (IDENTICAL, WITHIN_TOLERANCE, DIVERGENT)
+
+Resolves four standard assignment outcomes:
+1. CORROBORATION: Independent sources agree on the same metric, time, and scope.
+2. CONTRADICTION: Competing claims for the exact same metric, period, and scope.
+3. RECONCILED: Divergence resolved by differing time, scope, or accounting definitions.
+4. EXTRACTION_FAILURE / UNCERTAIN: Insufficient grounding or unresolvable ambiguity.
+"""
+
+import uuid
 import logging
-from src.facts.models import (
-    Fact, FactComparison, RelationshipType, KnowledgeLayer, Evidence
-)
+from typing import List, Dict, Optional, Set, Tuple
+from collections import defaultdict
+from src.facts.models import Fact, FactComparison, RelationshipType, KnowledgeLayer
+from src.facts.normalization import resolve_entity_alias, resolve_predicate_similarity
 
 logger = logging.getLogger(__name__)
 
 
 class ReconciliationEngine:
-    """Discovers relationships and reconciles facts across documents and sections."""
+    """Evaluates comparability and resolves relationships between extracted facts."""
 
-    def __init__(self, relative_tolerance: float = 0.015):
+    def __init__(self, relative_tolerance: float = 0.05):
         self.tolerance = relative_tolerance
 
     def reconcile(self, facts: List[Fact], documents: List[str] = None) -> KnowledgeLayer:
-        """Cluster facts and identify corroborations, contradictions, and reconciliations."""
+        """Reconcile facts dynamically across documents."""
         docs = documents or sorted(list(set(f.evidence.document_name for f in facts if f.evidence)))
         comparisons: List[FactComparison] = []
 
-        clusters = self._cluster_facts(facts)
+        # 1. Cluster candidate facts by broad conceptual predicate similarity
+        candidate_pairs = self._generate_candidate_pairs(facts)
 
-        for key, cluster_facts in clusters.items():
-            cluster_comparisons = self._compare_cluster(cluster_facts)
-            comparisons.extend(cluster_comparisons)
-
-        explicit_comparisons = self._generate_case_demonstrations(facts, docs)
-        existing_titles = set(c.title for c in comparisons)
-        for comp in explicit_comparisons:
-            if comp.title not in existing_titles:
+        # 2. Evaluate each pair through the comparability decision matrix
+        for f_a, f_b in candidate_pairs:
+            comp = self._evaluate_pairwise_comparability(f_a, f_b)
+            if comp:
                 comparisons.append(comp)
 
-        # Deduplicate comparisons with similar titles
-        seen_keys = set()
+        # 3. Deduplicate comparisons
+        seen_keys: Set[tuple] = set()
         deduped: List[FactComparison] = []
         for c in comparisons:
             pair_key = (
@@ -64,364 +76,219 @@ class ReconciliationEngine:
             statistics=stats
         )
 
-    def _normalize_attribute_key(self, attr: str) -> str:
-        """Group semantically related attributes into shared cluster keys."""
-        a = attr.lower()
-        if any(w in a for w in ["gdp", "economic growth"]):
-            return "gdp_growth"
-        if any(w in a for w in ["inflation", "cpi"]):
-            return "inflation"
-        if any(w in a for w in ["fiscal deficit", "revenue deficit", "deficit"]):
-            return "fiscal_deficit"
-        if any(w in a for w in ["revenue", "turnover", "sales"]):
-            return "revenue"
-        if any(w in a for w in ["pin code", "postal"]):
-            return "pin_codes"
-        if any(w in a for w in ["customer", "clients"]):
-            return "customers"
-        if any(w in a for w in ["capacity", "sort"]):
-            return "sort_capacity"
-        return re.sub(r'[^a-z0-9]', '', a)[:16]
+    def _generate_candidate_pairs(self, facts: List[Fact]) -> List[Tuple[Fact, Fact]]:
+        """Identify candidate pairs sharing predicate or semantic affinity."""
+        pairs = []
+        n = len(facts)
+        if n < 2:
+            return pairs
 
-    def _cluster_facts(self, facts: List[Fact]) -> Dict[str, List[Fact]]:
+        # Group facts by loose predicate key to prevent quadratic explosion on large corpora
         clusters = defaultdict(list)
         for f in facts:
-            key = self._normalize_attribute_key(f.attribute)
-            clusters[key].append(f)
-        return clusters
+            stem = f.attribute.lower()
+            # Extract key nouns/words, ignoring generic scope and filler words
+            words = [w for w in stem.split() if len(w) > 3 and w not in ["consolidated", "standalone", "domestic", "international", "total", "overall"]]
+            cluster_key = words[0] if words else stem[:10]
+            clusters[cluster_key].append(f)
 
-    def _compare_cluster(self, cluster_facts: List[Fact]) -> List[FactComparison]:
-        comparisons = []
-        n = len(cluster_facts)
-        if n < 2:
-            return comparisons
+        seen_pairs: Set[tuple] = set()
 
-        # Cap cluster comparisons to avoid quadratic explosion on large docs
-        max_comparisons = min(n, 12)
+        for key, cluster_facts in clusters.items():
+            k_len = len(cluster_facts)
+            for i in range(min(k_len, 12)):
+                for j in range(i + 1, min(k_len, 12)):
+                    f1 = cluster_facts[i]
+                    f2 = cluster_facts[j]
+                    pair_id = tuple(sorted([f1.id, f2.id]))
+                    if pair_id not in seen_pairs:
+                        seen_pairs.add(pair_id)
+                        pairs.append((f1, f2))
 
-        for i in range(max_comparisons):
-            for j in range(i + 1, max_comparisons):
-                f_a = cluster_facts[i]
-                f_b = cluster_facts[j]
+        return pairs
 
-                doc_a = f_a.evidence.document_name if f_a.evidence else "DocA"
-                doc_b = f_b.evidence.document_name if f_b.evidence else "DocB"
-                page_a = f_a.evidence.page_number if f_a.evidence else 0
-                page_b = f_b.evidence.page_number if f_b.evidence else 0
+    def _evaluate_pairwise_comparability(self, f_a: Fact, f_b: Fact) -> Optional[FactComparison]:
+        """Construct explicit multi-dimensional comparability decision matrix."""
+        # 1. Entity comparability
+        entity_match = resolve_entity_alias(f_a.subject, f_b.subject)
 
-                # Skip identical fact on same page
-                if doc_a == doc_b and page_a == page_b and f_a.value == f_b.value:
-                    continue
+        # 2. Predicate comparability
+        pred_match = resolve_predicate_similarity(f_a.attribute, f_b.attribute)
+        if pred_match == "DIFFERENT":
+            return None  # Facts refer to unrelated predicates
 
-                if f_a.normalized_value is not None and f_b.normalized_value is not None:
-                    comp = self._evaluate_numeric_pair(f_a, f_b)
-                    if comp:
-                        comparisons.append(comp)
+        # 3. Unit compatibility
+        unit_a = (f_a.unit or "").strip().upper()
+        unit_b = (f_b.unit or "").strip().upper()
+        if not unit_a or not unit_b:
+            unit_match = "UNKNOWN"
+        elif unit_a == unit_b:
+            unit_match = "COMPATIBLE"
+        else:
+            unit_match = "INCOMPATIBLE"
 
-        return comparisons
+        # 4. Temporal compatibility
+        time_a = f_a.temporal_scope
+        time_b = f_b.temporal_scope
+        if not time_a or not time_b:
+            time_match = "UNKNOWN"
+        elif time_a.strip().upper() == time_b.strip().upper():
+            time_match = "SAME"
+        else:
+            time_match = "DIFFERENT"
 
-    def _evaluate_numeric_pair(self, f_a: Fact, f_b: Fact) -> Optional[FactComparison]:
+        # 5. Contextual Scope compatibility
+        scope_a = f_a.context_scope
+        scope_b = f_b.context_scope
+        if not scope_a or not scope_b:
+            scope_match = "UNKNOWN"
+        elif scope_a.strip().upper() == scope_b.strip().upper():
+            scope_match = "SAME"
+        else:
+            scope_match = "DIFFERENT"
+
+        # 6. Numeric Value Comparison
         val_a = f_a.normalized_value
         val_b = f_b.normalized_value
 
-        if val_a == 0 or val_b == 0:
-            return None
-
-        rel_diff = abs(val_a - val_b) / max(abs(val_a), abs(val_b))
-        same_time = (f_a.temporal_scope == f_b.temporal_scope) and f_a.temporal_scope is not None
-        same_scope = (f_a.context_scope == f_b.context_scope) and f_a.context_scope is not None
-        is_cross_doc = (f_a.evidence and f_b.evidence and f_a.evidence.document_name != f_b.evidence.document_name)
-
-        # 1. Corroboration: Values match within tolerance
-        if rel_diff <= self.tolerance:
-            if same_scope or same_time:
-                scope_str = f" ({f_a.temporal_scope})" if f_a.temporal_scope else ""
-                scope_label = "Cross-Document Corroboration" if is_cross_doc else "Intra-Document Verification"
+        if val_a is None or val_b is None:
+            # Non-numeric comparison or failure to normalize
+            if unit_match == "INCOMPATIBLE":
                 return FactComparison(
-                    relationship_type=RelationshipType.CORROBORATION,
-                    title=f"{scope_label}: {f_a.attribute}{scope_str}",
+                    id=f"comp_{uuid.uuid4().hex[:8]}",
+                    relationship_type=RelationshipType.EXTRACTION_FAILURE,
+                    title=f"Uncertain Comparison: {f_a.attribute} (Incompatible Units)",
                     fact_a=f_a,
                     fact_b=f_b,
                     explanation=(
-                        f"Both sources report matching figures for '{f_a.attribute}'. "
-                        f"Source A ({f_a.evidence.document_name if f_a.evidence else 'Doc A'}, P.{f_a.evidence.page_number if f_a.evidence else '?'}) states '{f_a.value}' and "
-                        f"Source B ({f_b.evidence.document_name if f_b.evidence else 'Doc B'}, P.{f_b.evidence.page_number if f_b.evidence else '?'}) states '{f_b.value}'. "
-                        f"Normalized delta is {rel_diff * 100:.2f}%, confirming cross-verification."
+                        f"Comparability Matrix:\n"
+                        f"Entity: {entity_match} | Predicate: {pred_match} | Unit: {unit_match}\n"
+                        f"Cannot evaluate numerical equivalence between '{f_a.value}' and '{f_b.value}' "
+                        f"due to incompatible unit definitions ('{f_a.unit}' vs '{f_b.unit}')."
                     ),
-                    reconciliation_factor="Numerical match within 1.5% tolerance across citations."
+                    reconciliation_factor="Uncertain: incompatible unit metrics"
+                )
+            return None
+
+        # Calculate relative delta
+        denom = max(abs(val_a), abs(val_b))
+        rel_diff = abs(val_a - val_b) / denom if denom > 0 else 0.0
+
+        if rel_diff <= self.tolerance:
+            val_relation = "WITHIN_TOLERANCE"
+        else:
+            val_relation = "DIVERGENT"
+
+        doc_a = f_a.evidence.document_name if f_a.evidence else "Doc A"
+        doc_b = f_b.evidence.document_name if f_b.evidence else "Doc B"
+        page_a = f_a.evidence.page_number if f_a.evidence else 0
+        page_b = f_b.evidence.page_number if f_b.evidence else 0
+
+        # Skip trivial identical intra-page duplicate citations
+        if doc_a == doc_b and page_a == page_b and f_a.value == f_b.value:
+            return None
+
+        matrix_repr = (
+            f"Comparability Decision Matrix:\n"
+            f"• Entity: {entity_match} ('{f_a.subject}' vs '{f_b.subject}')\n"
+            f"• Predicate: {pred_match} ('{f_a.attribute}' vs '{f_b.attribute}')\n"
+            f"• Unit: {unit_match} ('{unit_a}' vs '{unit_b}')\n"
+            f"• Temporal Scope: {time_match} ('{time_a}' vs '{time_b}')\n"
+            f"• Context Scope: {scope_match} ('{scope_a}' vs '{scope_b}')\n"
+            f"• Value Relation: {val_relation} (Δ = {rel_diff * 100:.2f}%)"
+        )
+
+        # CASE 1: CORROBORATION
+        # Same metric, matching entity, matching scope & time, values agree within tolerance
+        if val_relation == "WITHIN_TOLERANCE" and unit_match in ["COMPATIBLE", "UNKNOWN"]:
+            time_str = f" ({time_a})" if time_a else ""
+            is_cross = (doc_a != doc_b)
+            prefix = "Cross-Document Corroboration" if is_cross else "Consistency Confirmation"
+            return FactComparison(
+                id=f"comp_{uuid.uuid4().hex[:8]}",
+                relationship_type=RelationshipType.CORROBORATION,
+                title=f"{prefix}: {f_a.attribute}{time_str}",
+                fact_a=f_a,
+                fact_b=f_b,
+                explanation=(
+                    f"Sources independently corroborate '{f_a.attribute}'.\n"
+                    f"Source A ({doc_a}, p.{page_a}): '{f_a.value}'\n"
+                    f"Source B ({doc_b}, p.{page_b}): '{f_b.value}'\n"
+                    f"Delta is {rel_diff * 100:.2f}%, within tolerance threshold ({self.tolerance * 100:.1f}%).\n\n"
+                    f"{matrix_repr}"
+                ),
+                reconciliation_factor="Numerical agreement within configured tolerance across verified source citations."
+            )
+
+        # CASE 2: RECONCILED BY TEMPORAL EVOLUTION
+        # Divergence explained by differing reporting periods
+        if time_match == "DIFFERENT":
+            return FactComparison(
+                id=f"comp_{uuid.uuid4().hex[:8]}",
+                relationship_type=RelationshipType.RECONCILED,
+                title=f"Reconciled by Period: {f_a.attribute} ({time_a} vs {time_b})",
+                fact_a=f_a,
+                fact_b=f_b,
+                explanation=(
+                    f"Apparent divergence in '{f_a.attribute}' ('{f_a.value}' vs '{f_b.value}') "
+                    f"is resolved by progression across temporal periods: '{time_a}' vs '{time_b}'.\n\n"
+                    f"{matrix_repr}"
+                ),
+                reconciliation_factor=f"Temporal period evolution: '{time_a}' -> '{time_b}'"
+            )
+
+        # CASE 3: RECONCILED BY REPORTING SCOPE / METHODOLOGY
+        # Divergence explained by differing scope (e.g. Consolidated vs Standalone, Domestic vs Global)
+        if scope_match == "DIFFERENT":
+            return FactComparison(
+                id=f"comp_{uuid.uuid4().hex[:8]}",
+                relationship_type=RelationshipType.RECONCILED,
+                title=f"Reconciled by Scope: {f_a.attribute} ({scope_a} vs {scope_b})",
+                fact_a=f_a,
+                fact_b=f_b,
+                explanation=(
+                    f"Discrepancy in '{f_a.attribute}' between '{f_a.value}' and '{f_b.value}' "
+                    f"is explained by differing reporting boundaries: '{scope_a}' vs '{scope_b}'.\n\n"
+                    f"{matrix_repr}"
+                ),
+                reconciliation_factor=f"Context boundary differentiation: '{scope_a}' vs '{scope_b}'"
+            )
+
+        # CASE 4: CONTRADICTION
+        # Same period, same scope, same entity & predicate, but values diverge significantly
+        if (time_match in ["SAME", "UNKNOWN"]) and (scope_match in ["SAME", "UNKNOWN"]) and val_relation == "DIVERGENT":
+            if unit_match in ["COMPATIBLE", "UNKNOWN"]:
+                is_cross = (doc_a != doc_b)
+                prefix = "Cross-Document Contradiction" if is_cross else "Internal Discrepancy"
+                return FactComparison(
+                    id=f"comp_{uuid.uuid4().hex[:8]}",
+                    relationship_type=RelationshipType.CONTRADICTION,
+                    title=f"{prefix}: {f_a.attribute}",
+                    fact_a=f_a,
+                    fact_b=f_b,
+                    explanation=(
+                        f"Direct contradiction detected for '{f_a.attribute}'.\n"
+                        f"Source A ({doc_a}, p.{page_a}) claims '{f_a.value}', whereas "
+                        f"Source B ({doc_b}, p.{page_b}) claims '{f_b.value}'.\n"
+                        f"Both claims share the same temporal scope ('{time_a or 'unspecified'}') "
+                        f"and context scope ('{scope_a or 'unspecified'}'), yielding an irreconcilable difference "
+                        f"of {rel_diff * 100:.2f}%.\n\n"
+                        f"{matrix_repr}"
+                    ),
+                    reconciliation_factor="Unreconciled contradiction: competing values reported for identical scope and period."
                 )
 
-        # 2. Reconciled by Scope: Differing context/scope boundary
-        if f_a.context_scope and f_b.context_scope and f_a.context_scope != f_b.context_scope:
-            return FactComparison(
-                relationship_type=RelationshipType.RECONCILED,
-                title=f"Reconciled by Reporting Scope: {f_a.attribute}",
-                fact_a=f_a,
-                fact_b=f_b,
-                explanation=(
-                    f"The difference between '{f_a.value}' ({f_a.context_scope}) and '{f_b.value}' ({f_b.context_scope}) "
-                    f"is resolved by differing reporting scopes and methodology boundaries."
-                ),
-                reconciliation_factor=f"Scope boundary difference: {f_a.context_scope} vs. {f_b.context_scope}"
-            )
-
-        # 3. Reconciled by Time / Evolution
-        if f_a.temporal_scope and f_b.temporal_scope and f_a.temporal_scope != f_b.temporal_scope:
-            return FactComparison(
-                relationship_type=RelationshipType.RECONCILED,
-                title=f"Reconciled by Temporal Scope: {f_a.attribute}",
-                fact_a=f_a,
-                fact_b=f_b,
-                explanation=(
-                    f"The variation between '{f_a.value}' ({f_a.temporal_scope}) and '{f_b.value}' ({f_b.temporal_scope}) "
-                    f"reflects progression across fiscal periods rather than contradictory data."
-                ),
-                reconciliation_factor=f"Temporal period evolution: '{f_a.temporal_scope}' -> '{f_b.temporal_scope}'"
-            )
-
-        # 4. Genuine Contradiction: Same time & scope across docs but different values
-        if is_cross_doc and same_time and rel_diff > 0.05:
-            return FactComparison(
-                relationship_type=RelationshipType.CONTRADICTION,
-                title=f"Contradiction: {f_a.attribute} ({f_a.temporal_scope or 'Same Period'})",
-                fact_a=f_a,
-                fact_b=f_b,
-                explanation=(
-                    f"Conflicting metrics reported across documents: {f_a.evidence.document_name if f_a.evidence else 'Doc A'} reports '{f_a.value}' "
-                    f"whereas {f_b.evidence.document_name if f_b.evidence else 'Doc B'} reports '{f_b.value}' (delta {rel_diff * 100:.1f}%)."
-                ),
-                reconciliation_factor=f"Unreconciled cross-document discrepancy without scope explanation"
-            )
-
-        return None
-
-    def _generate_case_demonstrations(self, facts: List[Fact], documents: List[str]) -> List[FactComparison]:
-        """Generate high-fidelity grounded case demonstrations based on detected document types."""
-        results = []
-
-        is_delhivery = any("delhivery" in d.lower() for d in documents) or any("delhivery" in f.subject.lower() for f in facts)
-        is_macro = any(any(m in d.lower() for m in ["rbi", "imf", "macro"]) for d in documents) or any("indian economy" in f.subject.lower() for f in facts)
-
-        # --- Macroeconomy (RBI & IMF) Grounded Case Demonstrations ---
-        if is_macro:
-            # 1. Corroboration: Real GDP Growth FY2024-25
-            rbi_gdp = next((f for f in facts if "rbi" in (f.evidence.document_name.lower() if f.evidence else "") and "6.5" in f.value), None)
-            imf_gdp = next((f for f in facts if "imf" in (f.evidence.document_name.lower() if f.evidence else "") and "6.5" in f.value), None)
-
-            if not rbi_gdp:
-                # Find any 6.5% GDP fact
-                rbi_gdp = next((f for f in facts if "6.5" in f.value and "gdp" in f.attribute.lower()), None)
-
-            if rbi_gdp:
-                if not imf_gdp and any("imf" in d.lower() for d in documents):
-                    imf_gdp = Fact(
-                        subject="Indian Economy",
-                        attribute="Real GDP Growth Rate",
-                        value="6.5%",
-                        normalized_value=6.5,
-                        unit="Percentage",
-                        temporal_scope="FY 2024-25",
-                        context_scope="IMF Staff Assessment",
-                        evidence=Evidence(
-                            document_name=next((d for d in documents if "imf" in d.lower()), "03-imf-india-2025-article-iv-excerpt.pdf"),
-                            page_number=10,
-                            verbatim_quote="India's real GDP grew by 6.5 percent in FY2024/25."
-                        )
-                    )
-
-                if imf_gdp:
-                    results.append(FactComparison(
-                        relationship_type=RelationshipType.CORROBORATION,
-                        title="Cross-Document Corroboration: India Real GDP Growth (FY 2024-25)",
-                        fact_a=rbi_gdp,
-                        fact_b=imf_gdp,
-                        explanation=(
-                            "India's Real GDP Growth for FY 2024-25 is corroborated across statutory central bank and multilateral sources. "
-                            "The RBI Annual Report (Page 8) notes that real GDP growth stood at 6.5 per cent, and the IMF Article IV Report "
-                            "(Page 10) corroborates that real GDP grew by 6.5 percent in FY2024/25. The two authoritative figures match exactly."
-                        ),
-                        reconciliation_factor="Exact agreement across independent central bank and IMF staff assessments."
-                    ))
-
-            # 2. Reconciled by Scope: Headline vs Core Inflation
-            headline_f = next((f for f in facts if "headline" in f.attribute.lower() and "4.6" in f.value), None)
-            core_f = next((f for f in facts if "core" in f.attribute.lower() and "4.6" in f.value), None)
-
-            if headline_f:
-                if not core_f and any("imf" in d.lower() for d in documents):
-                    core_f = Fact(
-                        subject="Indian Economy",
-                        attribute="Core CPI Inflation",
-                        value="4.6%",
-                        normalized_value=4.6,
-                        unit="Percentage",
-                        temporal_scope="FY 2024-25",
-                        context_scope="Core Basket (Excluding Food and Fuel)",
-                        evidence=Evidence(
-                            document_name=next((d for d in documents if "imf" in d.lower()), "03-imf-india-2025-article-iv-excerpt.pdf"),
-                            page_number=10,
-                            verbatim_quote="Core inflation increased to 4.6 percent (from 3.5 percent FY2024/25 average), in part due to..."
-                        )
-                    )
-
-                if core_f:
-                    results.append(FactComparison(
-                        relationship_type=RelationshipType.RECONCILED,
-                        title="Reconciled by Scope: Headline CPI Inflation vs Core CPI Inflation (4.6%)",
-                        fact_a=headline_f,
-                        fact_b=core_f,
-                        explanation=(
-                            "Both sources cite a 4.6% inflation figure for the fiscal period, but represent fundamentally different economic baskets. "
-                            "The RBI figure refers to Headline CPI Inflation (including volatile food and fuel components), whereas the IMF figure "
-                            "refers to Core Inflation (stripping out food and fuel price volatility). The apparent numerical collision is reconciled by basket composition."
-                        ),
-                        reconciliation_factor="Scope differentiation: Headline CPI Basket (All Items) vs Core Basket (ex-food & fuel)"
-                    ))
-
-            # 3. Handled Edge Case: Fiscal Deficit Accounting & Negative Indicator Deviations
-            results.append(FactComparison(
-                relationship_type=RelationshipType.EXTRACTION_FAILURE,
-                title="Handled Edge Case: Parenthesized Deficit & Negative Accounting Notation",
-                fact_a=Fact(
-                    subject="Central Government Finances",
-                    attribute="Gross Fiscal Deficit",
-                    value="4.8% of GDP",
-                    normalized_value=-4.8,
-                    unit="Percentage of GDP",
-                    temporal_scope="FY 2024-25 (BE)",
-                    context_scope="Union Budget Fiscal Ratio",
-                    evidence=Evidence(
-                        document_name=next((d for d in documents if "rbi" in d.lower()), "02-rbi-annual-report-2024-25-excerpt.pdf"),
-                        page_number=70,
-                        verbatim_quote="Gross fiscal deficit (GFD) for 2024-25 was budgeted at 4.8 per cent of GDP as against 5.6 per cent in 2023-24 (RE).",
-                        table_citation="Table II.6.1: Key Fiscal Indicators of the Central Government"
-                    )
-                ),
-                fact_b=None,
-                explanation=(
-                    "Failure Case Encountered: In macroeconomic tables, deficit metrics and negative inflation contributions "
-                    "e.g. '(-) 2.5 per cent' (Fuel Inflation) or fiscal deficits are formatted with parenthetical signs '(-)' "
-                    "or labeled as 'Deficit' without explicit algebraic minus signs. Naive extractors frequently misclassify deficits as surplus.\n"
-                    "System Mitigation: The engine applies semantic context mapping—detecting accounting terminology ('deficit', 'negative', 'decline', '(-)') "
-                    "to maintain financial polarity while linking verbatim table citations."
-                ),
-                reconciliation_factor="Contextual Polarity Verification & Accounting Deficit Notation Handler"
-            ))
-
-        # --- Delhivery Grounded Case Demonstrations ---
-        elif is_delhivery:
-            rev_ar_consol = next((f for f in facts if "annual-report" in f.evidence.document_name.lower() and f.context_scope == "Consolidated" and "81,415" in f.value), None)
-            rev_pres = next((f for f in facts if "presentation" in f.evidence.document_name.lower() and "8,142" in f.value), None)
-            rev_ar_standalone = next((f for f in facts if "annual-report" in f.evidence.document_name.lower() and f.context_scope == "Standalone"), None)
-            pin_prospectus = next((f for f in facts if "prospectus" in f.evidence.document_name.lower() and "17,488" in f.value), None)
-            pin_ar = next((f for f in facts if "annual-report" in f.evidence.document_name.lower() and "18,793" in f.value), None)
-
-            if rev_ar_consol and rev_pres:
-                if rev_ar_consol.evidence:
-                    rev_ar_consol.evidence.table_citation = "Consolidated Statement of Profit & Loss (Table on Page 22)"
-                if rev_pres.evidence:
-                    rev_pres.evidence.image_citation = "Slide 9: FY24 Financial & Operational Highlights (Figure 1)"
-                results.append(FactComparison(
-                    relationship_type=RelationshipType.CORROBORATION,
-                    title="Corroboration: FY24 Consolidated Revenue",
-                    fact_a=rev_ar_consol,
-                    fact_b=rev_pres,
-                    explanation=(
-                        "The FY24 Consolidated Revenue from Operations is corroborated across both the statutory Annual Report "
-                        "and the Q4 Earnings Presentation. The Annual Report lists '₹ 81,415.38 million' (₹81.415 Billion), "
-                        "which converts to ₹8,141.538 Cr. The Earnings Presentation rounds this to '₹8,142 Cr'. "
-                        "The two representations match within 0.005%."
-                    ),
-                    reconciliation_factor="Unit normalization: ₹81,415.38 million == ₹8,142 Cr (standard roundoff)"
-                ))
-
-            pres_7224 = next((f for f in facts if "presentation" in f.evidence.document_name.lower() and "7,224" in f.value), None)
-            pres_7225 = next((f for f in facts if "presentation" in f.evidence.document_name.lower() and "7,225" in f.value), None)
-            if pres_7224 and pres_7225:
-                if pres_7224.evidence:
-                    pres_7224.evidence.image_citation = "Slide 9: Revenue by Service Segment (Chart 2)"
-                if pres_7225.evidence:
-                    pres_7225.evidence.image_citation = "Slide 14: Historical Trajectory & Margins (Table 3)"
-                results.append(FactComparison(
-                    relationship_type=RelationshipType.CONTRADICTION,
-                    title="Genuine Contradiction: FY23 Revenue Figure in Presentation Slides",
-                    fact_a=pres_7224,
-                    fact_b=pres_7225,
-                    explanation=(
-                        "An internal contradiction appears within the Q4 FY24 Earnings Presentation. "
-                        "Slide 9 displays FY23 Consolidated Revenue as '7,224' (in Cr), whereas Slide 14 displays "
-                        "FY23 Consolidated Revenue as '7,225' (in Cr). The statutory Annual Report (Page 22) gives the exact "
-                        "audited figure as ₹72,253.01 million (7,225.3 Cr), proving that Slide 9 has a 1 Cr roundoff/truncation error."
-                    ),
-                    reconciliation_factor="Unreconciled internal discrepancy (7,224 Cr vs 7,225 Cr) without contextual explanation"
-                ))
-
-            if rev_ar_standalone and rev_ar_consol:
-                if rev_ar_standalone.evidence:
-                    rev_ar_standalone.evidence.table_citation = "Standalone Statement of Profit & Loss (Table on Page 22)"
-                if rev_ar_consol.evidence:
-                    rev_ar_consol.evidence.table_citation = "Consolidated Statement of Profit & Loss (Table on Page 22)"
-                results.append(FactComparison(
-                    relationship_type=RelationshipType.RECONCILED,
-                    title="Apparent Contradiction Reconciled by Scope: FY24 Revenue Standalone vs. Consolidated",
-                    fact_a=rev_ar_standalone,
-                    fact_b=rev_ar_consol,
-                    explanation=(
-                        "In the FY24 Annual Report (Page 22), Delhivery reports FY24 Revenue from Operations as ₹74,540.82 million "
-                        "in one paragraph, and ₹81,415.38 million in the adjacent paragraph. "
-                        "This apparent ₹6,874.56 million conflict is reconciled by the context of reporting scope: "
-                        "₹74,540.82 million is the Standalone Company revenue, while ₹81,415.38 million is the Consolidated Group revenue "
-                        "(incorporating subsidiaries such as Spoton Logistics)."
-                    ),
-                    reconciliation_factor="Scope differentiation: Standalone Entity vs Consolidated Group"
-                ))
-
-            if pin_prospectus and pin_ar:
-                if pin_prospectus.evidence:
-                    pin_prospectus.evidence.table_citation = "Historical Network Expansion Metrics (Table on Page 44)"
-                if pin_ar.evidence:
-                    pin_ar.evidence.table_citation = "Operational Infrastructure Summary (Table on Page 22)"
-                results.append(FactComparison(
-                    relationship_type=RelationshipType.RECONCILED,
-                    title="Apparent Contradiction Reconciled by Time: PIN Code Network Coverage",
-                    fact_a=pin_prospectus,
-                    fact_b=pin_ar,
-                    explanation=(
-                        "The Prospectus states Delhivery services 17,488 PIN codes, while the FY24 Annual Report states 18,793 PIN codes. "
-                        "This difference of 1,305 PIN codes is not a contradiction, but an expansion reconciled by time period: "
-                        "17,488 PIN codes as of December 31, 2021 vs. 18,793 PIN codes as of March 31, 2024."
-                    ),
-                    reconciliation_factor="Temporal evolution: Dec 31, 2021 vs March 31, 2024"
-                ))
-
-            results.append(FactComparison(
-                relationship_type=RelationshipType.EXTRACTION_FAILURE,
-                title="Handled Edge Case: Parenthesized Negative Values & Unit Ambiguity",
-                fact_a=Fact(
-                    subject="Delhivery Limited",
-                    attribute="Net Profit / Loss for FY24",
-                    value="Loss of ₹ 2,491.86 million",
-                    normalized_value=-2491860000.0,
-                    unit="INR",
-                    temporal_scope="FY 2023-24",
-                    context_scope="Consolidated",
-                    evidence=Evidence(
-                        document_name=rev_ar_consol.evidence.document_name if rev_ar_consol and rev_ar_consol.evidence else "02-delhivery-annual-report-fy24-excerpt.pdf",
-                        page_number=22,
-                        verbatim_quote="Whereas the loss for FY24 stood at ₹ 1,679.68 million as against ₹ 8,123.02 million for FY23.",
-                        table_citation="Consolidated Statement of Profit & Loss (Table on Page 22)"
-                    )
-                ),
-                fact_b=None,
-                explanation=(
-                    "Failure Case Encountered: In standard financial PDF statements, losses are frequently formatted either "
-                    "with parenthetical notation e.g. '(2,491.86)' without an explicit minus sign, or stated in text as 'loss stood at ₹ 2,491.86 million'. "
-                    "A naive regex or LLM extraction frequently misinterprets '(2,491.86)' or 'loss ₹2,491.86M' as a positive profit of +2.49B.\n"
-                    "System Mitigation: The system applies contextual semantic polarity verification—checking for proximity keywords "
-                    "('loss', 'reduction of loss', 'negative', parentheses) to correctly invert the normalized numeric value to -2,491,860,000.0 INR, "
-                    "preventing severe financial polarity inversion errors."
-                ),
-                reconciliation_factor="Contextual Polarity Verification & Parenthetical Accounting Notation Handler"
-            ))
-
-        return results
+        # CASE 5: EXTRACTION_FAILURE / UNCERTAIN
+        return FactComparison(
+            id=f"comp_{uuid.uuid4().hex[:8]}",
+            relationship_type=RelationshipType.EXTRACTION_FAILURE,
+            title=f"Uncertain Comparison: {f_a.attribute}",
+            fact_a=f_a,
+            fact_b=f_b,
+            explanation=(
+                f"The system detected related candidate facts but cannot determine a conclusive relationship "
+                f"due to unaligned scopes or missing unit definitions.\n\n"
+                f"{matrix_repr}"
+            ),
+            reconciliation_factor="Uncertain relationship: indeterminate scope or unit alignment"
+        )

@@ -280,18 +280,11 @@ class PDFLoader:
 
         doc.close()
 
-        tags = []
-        lower_name = doc_name.lower()
-        if "annual-report" in lower_name or "annual" in lower_name:
-            tags.extend(["Annual Report", "Financials"])
-        elif "presentation" in lower_name:
-            tags.extend(["Investor Deck", "Q4 Highlights"])
-        elif "prospectus" in lower_name:
-            tags.extend(["Prospectus", "Regulatory"])
-        elif "attention" in lower_name or "transformer" in lower_name:
-            tags.extend(["NLP", "Transformers", "Research"])
-        else:
-            tags.append("PDF Document")
+        tags = ["PDF Document"]
+        if all_tables:
+            tags.append("Structured Tables")
+        if total_pages > 1:
+            tags.append(f"{total_pages} Pages")
 
         title = path.stem.replace("-", " ").replace("_", " ").title()
 
