@@ -149,7 +149,7 @@ export default function App() {
 
   const handleCreateSession = async (promptForTitle = true) => {
     let title = '';
-    const defaultTitle = `Workspace ${new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} ${new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}`;
+    const defaultTitle = `Workspace ${sessions.length + 1}`;
     if (promptForTitle) {
       const input = prompt('Enter a title for the new workspace:', defaultTitle);
       if (input === null) return; // User cancelled
@@ -224,7 +224,8 @@ export default function App() {
         if (updatedSessions.length > 0) {
           setCurrentSessionId(updatedSessions[0].id);
         } else {
-          await handleCreateSession(false);
+          setCurrentSessionId(null);
+          setSessionData(null);
         }
       }
       await fetchStorageQuota();
@@ -246,22 +247,27 @@ export default function App() {
   };
 
   const handleStartConversation = async () => {
-    try {
-      const title = `Workspace ${new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} ${new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}`;
-      const res = await fetch('/api/sessions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title, description: 'Interactive multimodal workspace.' })
-      });
-      const newSession = await res.json();
-      await fetchSessions();
-      setCurrentSessionId(newSession.id);
+    if (sessions.length > 0) {
+      if (!currentSessionId) {
+        setCurrentSessionId(sessions[0].id);
+      }
       setCurrentView('workspace');
-      setShowUploadModal(true);
-    } catch (err) {
-      console.error('Failed to create workspace:', err);
+    } else {
+      try {
+        const res = await fetch('/api/sessions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title: 'Workspace 1', description: 'Interactive multimodal workspace.' })
+        });
+        if (res.ok) {
+          const newSession = await res.json();
+          await fetchSessions();
+          setCurrentSessionId(newSession.id);
+        }
+      } catch (err) {
+        console.error('Failed to create initial workspace:', err);
+      }
       setCurrentView('workspace');
-      setShowUploadModal(true);
     }
   };
 
@@ -489,31 +495,37 @@ export default function App() {
               </div>
               
               <div className="workspace-dropdown-list">
-                {sessions.map(s => {
-                  const isActive = s.id === currentSessionId;
-                  const docCount = s.total_documents ?? s.documents?.length ?? 0;
-                  return (
-                    <div
-                      key={s.id}
-                      className={`workspace-dropdown-item ${isActive ? 'active' : ''}`}
-                      onClick={() => {
-                        setCurrentSessionId(s.id);
-                        setShowWorkspaceDropdown(false);
-                      }}
-                      onContextMenu={(e) => handleWorkspaceContextMenu(e, s)}
-                      title="Right-click to Rename or Delete"
-                    >
-                      <div className="workspace-item-left">
-                        <Folder size={16} color={isActive ? 'var(--primary)' : '#8c8072'} />
-                        <span className="workspace-item-name">{s.title}</span>
+                {sessions.length === 0 ? (
+                  <div style={{ padding: '24px 16px', textAlign: 'center', color: 'var(--text-muted)', fontSize: '0.88rem' }}>
+                    No workspaces yet.<br />Click <strong>+ New</strong> above to create one.
+                  </div>
+                ) : (
+                  sessions.map(s => {
+                    const isActive = s.id === currentSessionId;
+                    const docCount = s.total_documents ?? s.documents?.length ?? 0;
+                    return (
+                      <div
+                        key={s.id}
+                        className={`workspace-dropdown-item ${isActive ? 'active' : ''}`}
+                        onClick={() => {
+                          setCurrentSessionId(s.id);
+                          setShowWorkspaceDropdown(false);
+                        }}
+                        onContextMenu={(e) => handleWorkspaceContextMenu(e, s)}
+                        title="Right-click to Rename or Delete"
+                      >
+                        <div className="workspace-item-left">
+                          <Folder size={16} color={isActive ? 'var(--primary)' : '#8c8072'} />
+                          <span className="workspace-item-name">{s.title}</span>
+                        </div>
+                        <div className="workspace-item-meta">
+                          <span>{docCount} docs</span>
+                          {isActive && <CheckCircle2 size={13} color="var(--primary)" />}
+                        </div>
                       </div>
-                      <div className="workspace-item-meta">
-                        <span>{docCount} docs</span>
-                        {isActive && <CheckCircle2 size={13} color="var(--primary)" />}
-                      </div>
-                    </div>
-                  );
-                })}
+                    );
+                  })
+                )}
               </div>
 
               <div className="workspace-dropdown-footer">
@@ -615,7 +627,25 @@ export default function App() {
           </div>
         </aside>
 
-        {navSection === 'Ask' ? (
+        {!currentSessionId || sessions.length === 0 ? (
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '60px 20px', textAlign: 'center' }}>
+            <div style={{ width: 64, height: 64, borderRadius: 16, background: 'rgba(217, 85, 34, 0.08)', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: 16 }}>
+              <Folder size={32} color="var(--primary)" />
+            </div>
+            <h2 style={{ fontSize: '1.3rem', fontWeight: 700, color: 'var(--text-title)', marginBottom: 8 }}>No Active Workspace</h2>
+            <p style={{ color: 'var(--text-muted)', maxWidth: 420, marginBottom: 24, fontSize: '0.92rem' }}>
+              Create a workspace to upload PDF documents, inspect grounded facts, and ask intelligent questions.
+            </p>
+            <button 
+              className="landing-cta-link" 
+              onClick={() => handleCreateSession(true)}
+              style={{ padding: '12px 24px', fontSize: '0.95rem', display: 'inline-flex', alignItems: 'center', gap: 8 }}
+            >
+              <Plus size={16} />
+              <span>Create New Workspace</span>
+            </button>
+          </div>
+        ) : navSection === 'Ask' ? (
           <>
             {/* Center Clean Chat Space */}
             <section className="ask-chat-main">

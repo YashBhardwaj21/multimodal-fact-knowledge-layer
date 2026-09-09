@@ -22,6 +22,7 @@ frontend/dist/
 # Storage and runtime data
 storage/buckets/*
 !storage/buckets/.gitkeep
+storage/*.db*
 test_*.pdf
 *.tmp
 

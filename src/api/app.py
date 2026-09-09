@@ -54,53 +54,6 @@ def get_session_vector_store(session_id: str) -> SessionVectorStore:
     return SESSION_VECTOR_STORES[session_id]
 
 
-def populate_delhivery_session():
-    """Seed Delhivery financial intelligence session with ground facts if PDFs exist."""
-    session = session_manager.get_session("delhivery_financial_intel")
-    if not session or session.knowledge_layer.facts:
-        return
-
-    delhivery_dir = Path("data/raw/delhivery")
-    if not delhivery_dir.exists():
-        return
-
-    docs_dict = pdf_loader.load_directory(str(delhivery_dir))
-    all_facts = []
-    vector_store = get_session_vector_store("delhivery_financial_intel")
-
-    for doc_name, pages in docs_dict.items():
-        facts = fact_extractor.extract_from_pages(pages)
-        all_facts.extend(facts)
-
-        blocks = []
-        for p in pages:
-            blocks.append({
-                "id": f"{doc_name}_p{p.page_number}",
-                "text": p.text[:1200],
-                "page_number": p.page_number
-            })
-        vector_store.add_blocks(doc_name, blocks)
-
-        pdf_file = delhivery_dir / doc_name
-        if pdf_file.exists():
-            try:
-                cdoc = pdf_loader.load_canonical_document(
-                    str(pdf_file),
-                    session_id="delhivery_financial_intel",
-                    render_thumbnails=True
-                )
-                if "delhivery_financial_intel" not in SESSION_CANONICAL_DOCS:
-                    SESSION_CANONICAL_DOCS["delhivery_financial_intel"] = {}
-                SESSION_CANONICAL_DOCS["delhivery_financial_intel"][doc_name] = cdoc
-            except Exception:
-                pass
-
-    session.knowledge_layer = reconciler.reconcile(all_facts, list(docs_dict.keys()))
-
-
-@app.on_event("startup")
-def startup_event():
-    threading.Thread(target=populate_delhivery_session, daemon=True).start()
 
 
 class CreateSessionRequest(BaseModel):
@@ -227,6 +180,10 @@ async def upload_document(session_id: str, file: UploadFile = File(...)):
         all_session_docs = sorted(list(set([d["filename"] for d in session.documents])))
         session.knowledge_layer = reconciler.reconcile(all_session_facts, all_session_docs)
 
+        # Persist document and updated knowledge layer into database
+        session_manager.add_document(session_id, doc_entry)
+        session_manager.save_knowledge_layer(session_id, session.knowledge_layer)
+
         return {
             "message": f"Successfully processed '{file.filename}'",
             "doc_id": canonical_doc.doc_id,
@@ -250,6 +207,18 @@ def list_session_documents(session_id: str):
     if not session:
         raise HTTPException(status_code=404, detail="Workspace session not found")
     return session.documents
+
+
+@app.delete("/api/sessions/{session_id}/documents/{doc_id}")
+def delete_session_document(session_id: str, doc_id: str):
+    """Delete a document from a workspace and database."""
+    session = session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Workspace session not found")
+    success = session_manager.delete_document(session_id, doc_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return {"message": f"Document {doc_id} deleted successfully"}
 
 
 @app.get("/api/sessions/{session_id}/documents/{doc_stem}/pages/{page_num}/thumbnail")
@@ -358,6 +327,8 @@ def session_chat(session_id: str, req: ChatQueryRequest):
         document_name=req.document_name,
         canonical_docs=canonical_dict
     )
+    for m in session.messages[-2:]:
+        session_manager.persist_message(session_id, m)
     return result
 
 

@@ -118,3 +118,12 @@ class SessionVectorStore:
             return self.search_hybrid(query, top_k=top_k, doc_filter=doc_filter, page_filter=None)
 
         return results
+
+    def delete_document(self, doc_name: str):
+        """Purge all vector embeddings and indexed blocks for a document."""
+        if self.collection:
+            try:
+                self.collection.delete(where={"document_name": doc_name})
+                logger.info(f"Purged vector index blocks for '{doc_name}' in session '{self.session_id}'")
+            except Exception as e:
+                logger.warning(f"Failed to delete vector blocks for '{doc_name}': {e}")

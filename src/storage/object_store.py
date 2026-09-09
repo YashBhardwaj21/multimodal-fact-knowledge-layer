@@ -1,4 +1,4 @@
-"""Session-partitioned object storage manager."""
+"""Session-partitioned object storage manager with pluggable MinIO/S3 and local blob support."""
 
 import os
 import shutil
@@ -11,13 +11,55 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Optional MinIO client
+try:
+    from minio import Minio
+    from minio.error import S3Error
+    MINIO_AVAILABLE = True
+except ImportError:
+    MINIO_AVAILABLE = False
+
 
 class ObjectStore:
-    """Manages session-partitioned storage for documents and visual artifacts."""
+    """Manages session-partitioned object storage for documents and visual artifacts.
+    
+    Supports local dedicated data storage (data/object_store/) and pluggable MinIO / S3.
+    """
 
-    def __init__(self, base_dir: str = "storage/buckets"):
+    def __init__(
+        self,
+        base_dir: str = "data/object_store",
+        minio_endpoint: Optional[str] = None,
+        minio_access_key: Optional[str] = None,
+        minio_secret_key: Optional[str] = None,
+        minio_bucket: str = "document-intelligence",
+        minio_secure: bool = False
+    ):
         self.base_dir = Path(base_dir)
         self.base_dir.mkdir(parents=True, exist_ok=True)
+
+        # Configure MinIO if environment variables or parameters provided
+        self.minio_endpoint = minio_endpoint or os.getenv("MINIO_ENDPOINT")
+        self.minio_access_key = minio_access_key or os.getenv("MINIO_ACCESS_KEY")
+        self.minio_secret_key = minio_secret_key or os.getenv("MINIO_SECRET_KEY")
+        self.minio_bucket = minio_bucket or os.getenv("MINIO_BUCKET", "document-intelligence")
+        self.minio_secure = minio_secure or (os.getenv("MINIO_SECURE", "false").lower() == "true")
+
+        self.minio_client: Optional[Any] = None
+        if MINIO_AVAILABLE and self.minio_endpoint and self.minio_access_key and self.minio_secret_key:
+            try:
+                self.minio_client = Minio(
+                    self.minio_endpoint,
+                    access_key=self.minio_access_key,
+                    secret_key=self.minio_secret_key,
+                    secure=self.minio_secure
+                )
+                if not self.minio_client.bucket_exists(self.minio_bucket):
+                    self.minio_client.make_bucket(self.minio_bucket)
+                logger.info(f"Connected to MinIO object storage at {self.minio_endpoint}, bucket: {self.minio_bucket}")
+            except Exception as e:
+                logger.warning(f"Could not connect to MinIO ({e}). Falling back to local object storage at {self.base_dir}")
+                self.minio_client = None
 
     def _get_session_dir(self, session_id: str) -> Path:
         session_dir = self.base_dir / session_id
@@ -50,29 +92,43 @@ class ObjectStore:
         return path
 
     def save_document(self, session_id: str, filename: str, file_obj: Union[BinaryIO, bytes]) -> Dict[str, Any]:
-        """Save a PDF file into session object storage."""
+        """Save a PDF file into session object storage (local and MinIO)."""
         docs_dir = self.get_documents_dir(session_id)
         target_path = docs_dir / filename
 
         if isinstance(file_obj, bytes):
-            file_obj = io.BytesIO(file_obj)
+            content_bytes = file_obj
+        else:
+            content_bytes = file_obj.read()
 
-        sha256_hash = hashlib.sha256()
-        bytes_written = 0
+        sha256_hash = hashlib.sha256(content_bytes).hexdigest()
+        bytes_written = len(content_bytes)
 
         with open(target_path, "wb") as f:
-            while chunk := file_obj.read(1024 * 1024):
-                sha256_hash.update(chunk)
-                f.write(chunk)
-                bytes_written += len(chunk)
+            f.write(content_bytes)
 
-        doc_id = f"doc_{sha256_hash.hexdigest()[:12]}"
+        # Upload to MinIO if enabled
+        if self.minio_client:
+            try:
+                object_name = f"{session_id}/documents/{filename}"
+                self.minio_client.put_object(
+                    bucket_name=self.minio_bucket,
+                    object_name=object_name,
+                    data=io.BytesIO(content_bytes),
+                    length=bytes_written,
+                    content_type="application/pdf"
+                )
+            except Exception as e:
+                logger.warning(f"MinIO document upload failed: {e}")
+
+        doc_id = f"doc_{sha256_hash[:12]}"
         return {
             "doc_id": doc_id,
             "filename": filename,
             "file_path": str(target_path),
+            "storage_path": f"{session_id}/documents/{filename}",
             "size_bytes": bytes_written,
-            "sha256": sha256_hash.hexdigest(),
+            "sha256": sha256_hash,
             "stored_at": datetime.now().isoformat()
         }
 
@@ -92,6 +148,19 @@ class ObjectStore:
         with open(thumb_path, "wb") as f:
             f.write(image_bytes)
 
+        if self.minio_client:
+            try:
+                object_name = f"{session_id}/thumbnails/{Path(doc_name).stem}/page_{page_number}.png"
+                self.minio_client.put_object(
+                    bucket_name=self.minio_bucket,
+                    object_name=object_name,
+                    data=io.BytesIO(image_bytes),
+                    length=len(image_bytes),
+                    content_type="image/png"
+                )
+            except Exception as e:
+                logger.debug(f"MinIO thumbnail upload skipped: {e}")
+
         return str(thumb_path)
 
     def get_page_thumbnail_path(self, session_id: str, doc_name: str, page_number: int) -> Optional[Path]:
@@ -108,7 +177,65 @@ class ObjectStore:
         with open(fig_path, "wb") as f:
             f.write(image_bytes)
 
+        if self.minio_client:
+            try:
+                object_name = f"{session_id}/figures/{Path(doc_name).stem}/{fig_id}.png"
+                self.minio_client.put_object(
+                    bucket_name=self.minio_bucket,
+                    object_name=object_name,
+                    data=io.BytesIO(image_bytes),
+                    length=len(image_bytes),
+                    content_type="image/png"
+                )
+            except Exception as e:
+                logger.debug(f"MinIO figure upload skipped: {e}")
+
         return str(fig_path)
+
+    def delete_document_files(self, session_id: str, doc_name: str) -> bool:
+        """Purge all binary assets (PDF, thumbnails, figures) for a specific document."""
+        stem = Path(doc_name).stem
+        deleted = False
+
+        # 1. Delete original PDF
+        pdf_file = self.get_documents_dir(session_id) / doc_name
+        if pdf_file.exists():
+            try:
+                pdf_file.unlink()
+                deleted = True
+            except Exception as e:
+                logger.warning(f"Failed to delete {pdf_file}: {e}")
+
+        # 2. Delete thumbnails folder for this doc
+        thumb_dir = self.get_thumbnails_dir(session_id) / stem
+        if thumb_dir.exists():
+            try:
+                shutil.rmtree(thumb_dir)
+                deleted = True
+            except Exception as e:
+                logger.warning(f"Failed to delete {thumb_dir}: {e}")
+
+        # 3. Delete figures folder for this doc
+        fig_dir = self.get_figures_dir(session_id) / stem
+        if fig_dir.exists():
+            try:
+                shutil.rmtree(fig_dir)
+                deleted = True
+            except Exception as e:
+                logger.warning(f"Failed to delete {fig_dir}: {e}")
+
+        # 4. Delete from MinIO if enabled
+        if self.minio_client:
+            try:
+                prefix = f"{session_id}/"
+                for obj in self.minio_client.list_objects(self.minio_bucket, prefix=prefix, recursive=True):
+                    if stem in obj.object_name or doc_name in obj.object_name:
+                        self.minio_client.remove_object(self.minio_bucket, obj.object_name)
+            except Exception as e:
+                logger.debug(f"MinIO document cleanup error: {e}")
+
+        logger.info(f"Deleted all object storage files for document '{doc_name}' in session '{session_id}'")
+        return deleted
 
     def get_session_storage_stats(self, session_id: str) -> Dict[str, Any]:
         """Calculate storage utilization for a specific session."""
@@ -162,12 +289,23 @@ class ObjectStore:
         }
 
     def delete_session_storage(self, session_id: str) -> bool:
-        """Purge storage for a session."""
+        """Purge all object storage for a session."""
         session_dir = self.base_dir / session_id
+        deleted = False
         if session_dir.exists():
             shutil.rmtree(session_dir)
-            return True
-        return False
+            deleted = True
+
+        if self.minio_client:
+            try:
+                prefix = f"{session_id}/"
+                for obj in self.minio_client.list_objects(self.minio_bucket, prefix=prefix, recursive=True):
+                    self.minio_client.remove_object(self.minio_bucket, obj.object_name)
+                deleted = True
+            except Exception as e:
+                logger.debug(f"MinIO session purge error: {e}")
+
+        return deleted
 
 
 default_object_store = ObjectStore()

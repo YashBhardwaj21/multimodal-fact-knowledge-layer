@@ -3,8 +3,16 @@ ocr:
   use_flash_attention: true
 
 storage:
-  base_dir: 'storage/buckets'
+  base_dir: 'data/object_store'
   max_quota_gb: 10
+  database_path: 'data/database/document_intelligence.db'
+  minio:
+    enabled: false
+    endpoint: 'localhost:9000'
+    bucket: 'document-intelligence'
+    access_key: 'minioadmin'
+    secret_key: 'minioadmin'
+    secure: false
 
 paths:
   raw_data: 'data/raw'

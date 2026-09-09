@@ -25,6 +25,8 @@ class Evidence:
     verbatim_quote: str
     context_snippet: Optional[str] = None
     char_offset: Optional[int] = None
+    table_citation: Optional[str] = None
+    image_citation: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
