@@ -4,10 +4,12 @@ import os
 import shutil
 import hashlib
 import io
+import json
 from pathlib import Path
 from typing import Dict, List, Optional, Any, BinaryIO, Union
 from datetime import datetime
 import logging
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -174,23 +176,67 @@ class ObjectStore:
         fig_dir.mkdir(parents=True, exist_ok=True)
         fig_path = fig_dir / f"{fig_id}.png"
 
-        with open(fig_path, "wb") as f:
-            f.write(image_bytes)
+        # Ensure valid PNG format via Pillow if needed
+        try:
+            with Image.open(io.BytesIO(image_bytes)) as img:
+                if img.mode in ("CMYK", "P"):
+                    img = img.convert("RGB")
+                img.save(fig_path, format="PNG")
+        except Exception:
+            with open(fig_path, "wb") as f:
+                f.write(image_bytes)
 
         if self.minio_client:
             try:
                 object_name = f"{session_id}/figures/{Path(doc_name).stem}/{fig_id}.png"
+                with open(fig_path, "rb") as f:
+                    data = f.read()
                 self.minio_client.put_object(
                     bucket_name=self.minio_bucket,
                     object_name=object_name,
-                    data=io.BytesIO(image_bytes),
-                    length=len(image_bytes),
+                    data=io.BytesIO(data),
+                    length=len(data),
                     content_type="image/png"
                 )
             except Exception as e:
                 logger.debug(f"MinIO figure upload skipped: {e}")
 
         return str(fig_path)
+
+    def save_figures_meta(self, session_id: str, doc_name: str, figures: List[Dict[str, Any]]) -> None:
+        """Save metadata json for figures extracted from a document."""
+        fig_dir = self.get_figures_dir(session_id) / Path(doc_name).stem
+        fig_dir.mkdir(parents=True, exist_ok=True)
+        meta_path = fig_dir / "meta.json"
+        try:
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(figures, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to save figures metadata: {e}")
+
+    def get_figures_meta(self, session_id: str, doc_name: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Retrieve all figure metadata for a session or document."""
+        figs_dir = self.get_figures_dir(session_id)
+        if not figs_dir.exists():
+            return []
+
+        all_meta = []
+        if doc_name:
+            stems = [Path(doc_name).stem]
+        else:
+            stems = [d.name for d in figs_dir.iterdir() if d.is_dir()]
+
+        for stem in stems:
+            meta_path = figs_dir / stem / "meta.json"
+            if meta_path.exists():
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                        if isinstance(meta, list):
+                            all_meta.extend(meta)
+                except Exception as e:
+                    logger.warning(f"Failed to read {meta_path}: {e}")
+        return all_meta
 
     def delete_document_files(self, session_id: str, doc_name: str) -> bool:
         """Purge all binary assets (PDF, thumbnails, figures) for a specific document."""

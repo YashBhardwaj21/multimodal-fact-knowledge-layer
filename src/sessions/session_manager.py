@@ -3,6 +3,7 @@
 import os
 import json
 import uuid
+import hashlib
 import sqlite3
 import threading
 from pathlib import Path
@@ -679,8 +680,34 @@ class SessionManager:
             conn = self._get_conn()
             try:
                 with conn:
-                    for f in knowledge_layer.facts:
-                        doc_id = f"doc_{Path(f.evidence.document_name).stem}" if f.evidence else "doc_unknown"
+                    # Map valid document IDs for this workspace
+                    doc_rows = conn.execute("SELECT id, filename FROM documents WHERE workspace_id = ?", (session_id,)).fetchall()
+                    valid_doc_map = {r["filename"]: r["id"] for r in doc_rows}
+                    default_doc_id = doc_rows[0]["id"] if doc_rows else None
+
+                    # Collect all facts including those embedded in comparisons
+                    all_facts_to_save = list(knowledge_layer.facts)
+                    saved_fact_ids = set()
+
+                    for c in knowledge_layer.comparisons:
+                        if c.fact_a and c.fact_a not in all_facts_to_save:
+                            all_facts_to_save.append(c.fact_a)
+                        if c.fact_b and c.fact_b not in all_facts_to_save:
+                            all_facts_to_save.append(c.fact_b)
+
+                    for f in all_facts_to_save:
+                        fname = f.evidence.document_name if f.evidence else "unknown.pdf"
+                        doc_id = valid_doc_map.get(fname)
+                        if not doc_id:
+                            # Register document if missing to satisfy foreign key
+                            doc_id = f"doc_{hashlib.md5((session_id + fname).encode()).hexdigest()[:12]}"
+                            title = Path(fname).stem.replace("-", " ").replace("_", " ").title()
+                            conn.execute(
+                                "INSERT OR IGNORE INTO documents (id, workspace_id, filename, title, file_size, storage_path, page_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                (doc_id, session_id, fname, title, 0, "", 1)
+                            )
+                            valid_doc_map[fname] = doc_id
+
                         conn.execute("""
                             INSERT OR REPLACE INTO facts (
                                 id, document_id, workspace_id, subject, predicate, value,
@@ -690,6 +717,8 @@ class SessionManager:
                             f.id, doc_id, session_id, f.subject, f.attribute, f.value,
                             f.normalized_value, f.unit, f.temporal_scope or "", f.context_scope or "", f.confidence
                         ))
+                        saved_fact_ids.add(f.id)
+
                         if f.evidence:
                             conn.execute("""
                                 INSERT OR REPLACE INTO evidence (
@@ -701,6 +730,8 @@ class SessionManager:
                             ))
 
                     for c in knowledge_layer.comparisons:
+                        fa_id = c.fact_a.id if (c.fact_a and c.fact_a.id in saved_fact_ids) else None
+                        fb_id = c.fact_b.id if (c.fact_b and c.fact_b.id in saved_fact_ids) else None
                         conn.execute("""
                             INSERT OR REPLACE INTO fact_relationships (
                                 id, workspace_id, fact_a_id, fact_b_id, relationship, title,
@@ -708,8 +739,7 @@ class SessionManager:
                             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """, (
                             c.id, session_id,
-                            c.fact_a.id if c.fact_a else None,
-                            c.fact_b.id if c.fact_b else None,
+                            fa_id, fb_id,
                             c.relationship_type.value, c.title, c.explanation,
                             c.reconciliation_factor, 1.0
                         ))
@@ -718,6 +748,25 @@ class SessionManager:
                 session.knowledge_layer = knowledge_layer
             finally:
                 conn.close()
+
+    def update_document_figures_count(self, session_id: str, filename: str, figures_count: int) -> None:
+        """Update the figures count for a document in SQLite and in-memory cache."""
+        session = self.get_session(session_id)
+        if session:
+            for d in session.documents:
+                if d.get("filename") == filename:
+                    d["figures_count"] = figures_count
+                    break
+
+        conn = self._get_conn()
+        try:
+            with conn:
+                conn.execute(
+                    "UPDATE documents SET figures_count = ? WHERE workspace_id = ? AND filename = ?",
+                    (figures_count, session_id, filename)
+                )
+        finally:
+            conn.close()
 
 
 default_session_manager = SessionManager()

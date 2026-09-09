@@ -360,6 +360,18 @@ a {
   min-width: 0;
 }
 
+.empty-workspace-view {
+  grid-column: 2 / -1 !important;
+  display: flex !important;
+  flex-direction: column !important;
+  align-items: center !important;
+  justify-content: center !important;
+  text-align: center !important;
+  width: 100% !important;
+  height: 100% !important;
+  min-height: calc(100vh - 100px);
+}
+
 /* Left Sidebar */
 .workspace-sidebar {
   border-right: 1px solid var(--border-subtle);
@@ -2022,5 +2034,11 @@ a {
   border-color: #f5d4c2;
 }
 
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
 
-
+.spin-animation {
+  animation: spin 1s linear infinite;
+}

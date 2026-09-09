@@ -246,13 +246,15 @@ class FactExtractor:
                 confidence=0.98
             ))
 
+        # 1. Real GDP Growth Rate (Actuals)
         gdp_actual = re.search(
-            r'real\s+GDP\s+(?:grew|rose|expanded)\s+(?:\(y-o-y\)\s+)?by\s+([\d\.]+)\s+per\s*cent',
+            r'(?:real\s+(?:gross\s+domestic\s+product\s*\(GDP\)\d*|GDP)\s+growth|economic\s+growth|real\s+GDP\s+grew)\s*(?:moderated\s+to|grew\s+by|expanded\s+by|stood\s+at|of)\s+([\d\.]+)\s*(?:per\s*cent|%)',
             text, re.IGNORECASE
         )
         if gdp_actual:
             val_str = gdp_actual.group(1)
             norm_val = float(val_str)
+            period = "FY 2024-25" if ("2024-25" in text or "FY2024/25" in text or "FY24" in text) else "Current Fiscal"
             snippet = self._find_surrounding_sentence(text, gdp_actual.start())
             facts.append(Fact(
                 subject="Indian Economy",
@@ -260,7 +262,7 @@ class FactExtractor:
                 value=f"{val_str}%",
                 normalized_value=norm_val,
                 unit="Percentage",
-                temporal_scope="FY 2024-25",
+                temporal_scope=period,
                 context_scope="Official Statistics",
                 evidence=Evidence(
                     document_name=doc,
@@ -271,54 +273,111 @@ class FactExtractor:
                 confidence=0.98
             ))
 
-        gdp_proj_rbi = re.search(
-            r'real\s+GDP\s+growth\s+for\s+(\d{4}[-/]\d{2,4})\s+is\s+projected\s+at\s+([\d\.]+)\s+per\s*cent',
+        # 2. Headline Inflation
+        headline_inf = re.search(
+            r'headline\s+(?:CPI\s+)?inflation.*?(?:averaged|stood\s+at|was|of)\s+([\d\.]+)\s*(?:per\s*cent|%)',
             text, re.IGNORECASE
         )
-        if gdp_proj_rbi:
-            period = gdp_proj_rbi.group(1)
-            val_str = gdp_proj_rbi.group(2)
+        if headline_inf:
+            val_str = headline_inf.group(1)
             norm_val = float(val_str)
-            snippet = self._find_surrounding_sentence(text, gdp_proj_rbi.start())
+            period = "FY 2024-25" if ("2024-25" in text or "FY2024/25" in text) else "Annual Average"
+            snippet = self._find_surrounding_sentence(text, headline_inf.start())
             facts.append(Fact(
                 subject="Indian Economy",
-                attribute="Projected Real GDP Growth",
+                attribute="Headline CPI Inflation",
                 value=f"{val_str}%",
                 normalized_value=norm_val,
                 unit="Percentage",
-                temporal_scope="FY 2025-26",
-                context_scope="RBI Baseline Projection",
+                temporal_scope=period,
+                context_scope="Headline CPI Basket (All Items)",
                 evidence=Evidence(
                     document_name=doc,
                     page_number=p_num,
                     verbatim_quote=snippet,
-                    char_offset=gdp_proj_rbi.start()
+                    char_offset=headline_inf.start()
                 ),
                 confidence=0.97
             ))
 
-        gdp_proj_imf = re.search(
-            r'real\s+GDP\s+growth\s+is\s+projected\s+at\s+([\d\.]+)\s+per\s*cent\s+in\s+(FY\d{4}/\d{2})',
+        # 3. Core Inflation
+        core_inf = re.search(
+            r'core\s+inflation.*?(?:increased\s+to|stood\s+at|was|of)\s+([\d\.]+)\s*(?:per\s*cent|%)',
             text, re.IGNORECASE
         )
-        if gdp_proj_imf:
-            val_str = gdp_proj_imf.group(1)
-            period = gdp_proj_imf.group(2)
+        if core_inf:
+            val_str = core_inf.group(1)
             norm_val = float(val_str)
-            snippet = self._find_surrounding_sentence(text, gdp_proj_imf.start())
+            period = "FY 2024-25" if ("2024-25" in text or "FY2024/25" in text) else "FY25 Benchmark"
+            snippet = self._find_surrounding_sentence(text, core_inf.start())
+            facts.append(Fact(
+                subject="Indian Economy",
+                attribute="Core CPI Inflation",
+                value=f"{val_str}%",
+                normalized_value=norm_val,
+                unit="Percentage",
+                temporal_scope=period,
+                context_scope="Core Basket (Excluding Food and Fuel)",
+                evidence=Evidence(
+                    document_name=doc,
+                    page_number=p_num,
+                    verbatim_quote=snippet,
+                    char_offset=core_inf.start()
+                ),
+                confidence=0.97
+            ))
+
+        # 4. Projected Real GDP Growth (RBI & IMF)
+        gdp_proj = re.search(
+            r'(?:real\s+GDP\s+growth|growth).*?(?:is\s+projected\s+at|projected\s+to\s+be|forecast\s+at|placed\s+at)\s+([\d\.]+)\s*(?:per\s*cent|%)',
+            text, re.IGNORECASE
+        )
+        if gdp_proj:
+            val_str = gdp_proj.group(1)
+            norm_val = float(val_str)
+            period = "FY 2025-26" if ("2025-26" in text or "FY2025/26" in text) else "Forecast Horizon"
+            scope = "IMF Staff Projection" if "imf" in doc.lower() else "RBI Baseline Projection"
+            snippet = self._find_surrounding_sentence(text, gdp_proj.start())
             facts.append(Fact(
                 subject="Indian Economy",
                 attribute="Projected Real GDP Growth",
                 value=f"{val_str}%",
                 normalized_value=norm_val,
                 unit="Percentage",
-                temporal_scope="FY 2025-26",
-                context_scope="IMF Article IV Staff Projection",
+                temporal_scope=period,
+                context_scope=scope,
                 evidence=Evidence(
                     document_name=doc,
                     page_number=p_num,
                     verbatim_quote=snippet,
-                    char_offset=gdp_proj_imf.start()
+                    char_offset=gdp_proj.start()
+                ),
+                confidence=0.96
+            ))
+
+        # 5. Gross Fiscal Deficit
+        fiscal_def = re.search(
+            r'(?:gross\s+)?fiscal\s+deficit.*?(?:stood\s+at|was|placed\s+at|moderated\s+to)\s+([\d\.]+)\s*(?:per\s*cent|%)\s+of\s+GDP',
+            text, re.IGNORECASE
+        )
+        if fiscal_def:
+            val_str = fiscal_def.group(1)
+            norm_val = float(val_str)
+            period = "FY 2024-25 (BE)" if "BE" in text else "FY 2024-25"
+            snippet = self._find_surrounding_sentence(text, fiscal_def.start())
+            facts.append(Fact(
+                subject="Indian Economy",
+                attribute="Gross Fiscal Deficit",
+                value=f"{val_str}% of GDP",
+                normalized_value=norm_val,
+                unit="Percentage of GDP",
+                temporal_scope=period,
+                context_scope="Union Budget Baseline",
+                evidence=Evidence(
+                    document_name=doc,
+                    page_number=p_num,
+                    verbatim_quote=snippet,
+                    char_offset=fiscal_def.start()
                 ),
                 confidence=0.97
             ))

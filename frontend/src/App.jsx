@@ -4,7 +4,8 @@ import {
   Settings, CheckCircle2, ChevronRight, ArrowLeft, Send,
   ExternalLink, Layers, Table, Image, ShieldCheck, Sparkles, Plus,
   Bookmark, HelpCircle, HardDrive, RefreshCw, X, Folder, ChevronDown,
-  Edit2, Trash2, MoreVertical
+  Edit2, Trash2, MoreVertical, AlertTriangle, GitCompare, ShieldAlert,
+  Download, ZoomIn
 } from 'lucide-react';
 
 export default function App() {
@@ -51,6 +52,42 @@ export default function App() {
   const [sessionFigures, setSessionFigures] = useState([]);
   const [sessionFacts, setSessionFacts] = useState([]);
   const [sessionComparisons, setSessionComparisons] = useState([]);
+  const [previewFigure, setPreviewFigure] = useState(null);
+  const [reconciliationFilter, setReconciliationFilter] = useState('all');
+  const [isReconciling, setIsReconciling] = useState(false);
+
+  const handleRecomputeReconciliation = async () => {
+    if (!currentSessionId) return;
+    setIsReconciling(true);
+    try {
+      const res = await fetch(`/api/sessions/${currentSessionId}/reconcile`, { method: 'POST' });
+      const data = await res.json();
+      if (data.comparisons) {
+        setSessionComparisons(data.comparisons);
+      }
+    } catch (e) {
+      console.error('Reconciliation error:', e);
+    } finally {
+      setIsReconciling(false);
+    }
+  };
+
+  const handleReprocessWorkspace = async () => {
+    if (!currentSessionId) return;
+    setIsUploading(true);
+    setUploadStatus('Reprocessing documents with upgraded visual & semantic extractors...');
+    try {
+      const res = await fetch(`/api/sessions/${currentSessionId}/reprocess`, { method: 'POST' });
+      await res.json();
+      await fetchSessions();
+      await loadSessionDetails(currentSessionId);
+    } catch (e) {
+      console.error('Reprocess error:', e);
+    } finally {
+      setIsUploading(false);
+      setUploadStatus('');
+    }
+  };
 
   // Close context menu & dropdown on outside click
   useEffect(() => {
@@ -421,9 +458,10 @@ export default function App() {
 
   const docFigures = selectedDoc
     ? sessionFigures.filter(f => {
-      if (!f.document) return true;
-      const normDoc = selectedDoc.filename.replace(/\.pdf$/i, '').toLowerCase();
-      return f.document.toLowerCase() === normDoc || f.document === selectedDoc.doc_id;
+      if (!f.document && !f.document_name) return true;
+      const cleanDoc = selectedDoc.filename.replace(/\.pdf$/i, '').replace(/[-_]/g, ' ').trim().toLowerCase();
+      const fDoc = (f.document || f.document_name || '').replace(/\.pdf$/i, '').replace(/[-_]/g, ' ').trim().toLowerCase();
+      return fDoc === cleanDoc || (f.document && f.document === selectedDoc.doc_id) || fDoc.includes(cleanDoc) || cleanDoc.includes(fDoc);
     })
     : sessionFigures;
 
@@ -664,20 +702,41 @@ export default function App() {
         </aside>
 
         {!currentSessionId || sessions.length === 0 ? (
-          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '60px 20px', textAlign: 'center' }}>
-            <div style={{ width: 64, height: 64, borderRadius: 16, background: 'rgba(217, 85, 34, 0.08)', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: 16 }}>
-              <Folder size={32} color="var(--primary)" />
+          <div
+            className="empty-workspace-view"
+            style={{
+              gridColumn: '2 / -1',
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              justifyContent: 'center',
+              padding: '60px 20px',
+              textAlign: 'center',
+              width: '100%',
+              minHeight: 'calc(100vh - 100px)'
+            }}
+          >
+            <div style={{ width: 68, height: 68, borderRadius: 18, background: 'rgba(217, 85, 34, 0.08)', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: 18 }}>
+              <Folder size={36} color="var(--primary)" />
             </div>
-            <h2 style={{ fontSize: '1.3rem', fontWeight: 700, color: 'var(--text-title)', marginBottom: 8 }}>No Active Workspace</h2>
-            <p style={{ color: 'var(--text-muted)', maxWidth: 420, marginBottom: 24, fontSize: '0.92rem' }}>
+            <h2 style={{ fontSize: '1.4rem', fontWeight: 700, color: 'var(--text-title)', marginBottom: 8 }}>No Active Workspace</h2>
+            <p style={{ color: 'var(--text-muted)', maxWidth: 460, marginBottom: 26, fontSize: '0.95rem', lineHeight: 1.55 }}>
               Create a workspace to upload PDF documents, inspect grounded facts, and ask intelligent questions.
             </p>
             <button
-              className="landing-cta-link"
+              className="btn-primary"
               onClick={() => handleCreateSession(true)}
-              style={{ padding: '12px 24px', fontSize: '0.95rem', display: 'inline-flex', alignItems: 'center', gap: 8 }}
+              style={{
+                padding: '12px 28px',
+                fontSize: '0.96rem',
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: 8,
+                cursor: 'pointer'
+              }}
             >
-              <Plus size={16} />
+              <Plus size={18} />
               <span>Create New Workspace</span>
             </button>
           </div>
@@ -1100,18 +1159,94 @@ export default function App() {
                   {/* TAB 3: Figures View */}
                   {activeTab === 'Figures' && (
                     <div style={{ flex: 1, overflowY: 'auto', padding: '16px 0' }}>
-                      <h3 style={{ fontSize: '1.05rem', fontWeight: 700, marginBottom: '12px' }}>
-                        Figures & Visual Diagrams ({docFigures.length})
-                      </h3>
-                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '16px' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '14px' }}>
+                        <div>
+                          <h3 style={{ fontSize: '1.05rem', fontWeight: 700 }}>
+                            Figures & Visual Diagrams ({docFigures.length})
+                          </h3>
+                          <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', margin: '2px 0 0 0' }}>
+                            Extracted vector charts, graphs, and visual figures with exact page grounding. Click any figure to inspect in high resolution.
+                          </p>
+                        </div>
+                        <button
+                          className="modal-btn-cancel"
+                          onClick={handleReprocessWorkspace}
+                          disabled={isUploading}
+                          style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '0.78rem', padding: '6px 12px' }}
+                        >
+                          <RefreshCw size={13} className={isUploading ? 'spin-animation' : ''} />
+                          {isUploading ? 'Reprocessing...' : 'Refresh Figures'}
+                        </button>
+                      </div>
+
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: '16px' }}>
                         {docFigures.map((fig, i) => (
-                          <div key={i} style={{ border: '1px solid var(--border-subtle)', borderRadius: '10px', overflow: 'hidden', background: '#faf8f5', textAlign: 'center', padding: '10px' }}>
-                            <img src={fig.url} alt={fig.figure_id} style={{ maxWidth: '100%', maxHeight: '140px', objectFit: 'contain' }} />
-                            <p style={{ fontSize: '0.78rem', marginTop: '8px', color: 'var(--text-muted)' }}>{fig.figure_id}</p>
+                          <div
+                            key={i}
+                            onClick={() => setPreviewFigure(fig)}
+                            style={{
+                              border: '1px solid var(--border-subtle)',
+                              borderRadius: '12px',
+                              overflow: 'hidden',
+                              background: '#ffffff',
+                              display: 'flex',
+                              flexDirection: 'column',
+                              cursor: 'pointer',
+                              transition: 'all 0.2s ease',
+                              boxShadow: '0 2px 8px rgba(0,0,0,0.03)'
+                            }}
+                            onMouseEnter={(e) => {
+                              e.currentTarget.style.transform = 'translateY(-2px)';
+                              e.currentTarget.style.boxShadow = '0 6px 16px rgba(0,0,0,0.08)';
+                              e.currentTarget.style.borderColor = 'var(--primary)';
+                            }}
+                            onMouseLeave={(e) => {
+                              e.currentTarget.style.transform = 'none';
+                              e.currentTarget.style.boxShadow = '0 2px 8px rgba(0,0,0,0.03)';
+                              e.currentTarget.style.borderColor = 'var(--border-subtle)';
+                            }}
+                          >
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 12px', background: '#faf8f5', borderBottom: '1px solid var(--border-subtle)' }}>
+                              <span className="reconciliation-citation-badge page" style={{ fontSize: '0.72rem', padding: '2px 7px' }}>
+                                Page {fig.page_number || '?'}
+                              </span>
+                              <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)', fontWeight: 600, textTransform: 'uppercase' }}>
+                                {fig.type === 'chart' ? 'Vector Chart' : 'Embedded Visual'}
+                              </span>
+                            </div>
+                            <div style={{ padding: '12px', background: '#fdfcf9', display: 'flex', alignItems: 'center', justifyContent: 'center', height: '170px' }}>
+                              <img
+                                src={fig.url}
+                                alt={fig.caption || fig.figure_id}
+                                style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }}
+                              />
+                            </div>
+                            <div style={{ padding: '10px 12px', borderTop: '1px solid var(--border-subtle)', flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'space-between' }}>
+                              <p style={{ fontSize: '0.82rem', fontWeight: 600, color: 'var(--text-title)', margin: 0, lineHeight: 1.35, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>
+                                {fig.caption || fig.figure_id}
+                              </p>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '8px', fontSize: '0.74rem', color: 'var(--text-muted)' }}>
+                                <span>{fig.width && fig.height ? `${fig.width}×${fig.height}px` : ''}</span>
+                                <span style={{ color: 'var(--primary)', fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: '3px' }}>
+                                  <ZoomIn size={12} /> Inspect
+                                </span>
+                              </div>
+                            </div>
                           </div>
                         ))}
                       </div>
-                      {docFigures.length === 0 && <p style={{ color: 'var(--text-muted)' }}>No figures or diagrams detected in this document.</p>}
+                      {docFigures.length === 0 && (
+                        <div style={{ textAlign: 'center', padding: '40px 16px', background: '#faf8f5', borderRadius: '12px', border: '1px dashed var(--border-subtle)' }}>
+                          <Image size={36} color="var(--text-muted)" style={{ margin: '0 auto 12px' }} />
+                          <p style={{ color: 'var(--text-title)', fontWeight: 600, marginBottom: '6px' }}>No figures or diagrams loaded yet</p>
+                          <p style={{ color: 'var(--text-muted)', fontSize: '0.84rem', maxWidth: '400px', margin: '0 auto 16px' }}>
+                            Run the upgraded hybrid figure extractor on this document to render vector charts and embedded images.
+                          </p>
+                          <button className="modal-btn-primary" onClick={handleReprocessWorkspace} style={{ padding: '8px 18px', fontSize: '0.85rem' }}>
+                            <RefreshCw size={14} style={{ marginRight: '6px' }} /> Extract Document Figures
+                          </button>
+                        </div>
+                      )}
                     </div>
                   )}
 
@@ -1133,131 +1268,211 @@ export default function App() {
                     </div>
                   )}
 
-                  {/* TAB 5: Cross-Document Reconciliation */}
+                  {/* TAB 5: Fact Reconciliation */}
                   {activeTab === 'Reconciliation' && (
                     <div style={{ flex: 1, overflowY: 'auto', padding: '16px 0', minWidth: 0 }}>
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '14px' }}>
-                        <h3 style={{ fontSize: '1.05rem', fontWeight: 700 }}>
-                          Cross-Document Reconciliation Matrix ({sessionComparisons.length})
-                        </h3>
-                        <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
-                          Automated reasoning with exact page & table citations
-                        </span>
+                        <div>
+                          <h3 style={{ fontSize: '1.05rem', fontWeight: 700 }}>
+                            {activeSessionObj?.documents?.length <= 1
+                              ? `Fact Verification & Reconciliation Matrix (${sessionComparisons.length})`
+                              : `Cross-Document Reconciliation Matrix (${sessionComparisons.length})`}
+                          </h3>
+                          <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                            Automated semantic reasoning with exact page, table & metric citations
+                          </span>
+                        </div>
+                        <button
+                          onClick={handleRecomputeReconciliation}
+                          disabled={isReconciling}
+                          style={{
+                            padding: '6px 12px',
+                            borderRadius: '8px',
+                            fontSize: '0.78rem',
+                            fontWeight: 600,
+                            border: '1px solid var(--border-subtle)',
+                            background: '#ffffff',
+                            color: 'var(--text-body)',
+                            cursor: 'pointer',
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '6px',
+                            transition: 'all 0.15s ease'
+                          }}
+                        >
+                          <RefreshCw size={13} className={isReconciling ? 'spin-animation' : ''} />
+                          {isReconciling ? 'Reconciling...' : 'Re-run Matrix'}
+                        </button>
                       </div>
 
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-                        {sessionComparisons.map((c, i) => (
-                          <div key={i} style={{ border: '1px solid var(--border-subtle)', borderRadius: '12px', padding: '18px', background: '#faf8f5' }}>
-                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
-                              <h4 style={{ fontSize: '0.98rem', fontWeight: 700, color: 'var(--text-title)' }}>{c.title}</h4>
-                              <span style={{ textTransform: 'uppercase', fontSize: '0.72rem', fontWeight: 700, padding: '4px 10px', borderRadius: '4px', background: c.relationship_type === 'corroboration' ? 'var(--success-bg)' : c.relationship_type === 'contradiction' ? 'var(--danger-bg)' : 'var(--primary-light)', color: c.relationship_type === 'corroboration' ? 'var(--success)' : c.relationship_type === 'contradiction' ? 'var(--danger)' : 'var(--primary)' }}>
-                                {c.relationship_type}
-                              </span>
-                            </div>
-
-                            <p style={{ fontSize: '0.88rem', color: 'var(--text-body)', lineHeight: 1.5, marginBottom: '12px' }}>
-                              {c.explanation}
-                            </p>
-
-                            {c.reconciliation_factor && (
-                              <div style={{ fontSize: '0.82rem', background: '#f2ece2', padding: '8px 12px', borderRadius: '6px', color: 'var(--primary)', fontWeight: 600, marginBottom: '12px' }}>
-                                Resolution: {c.reconciliation_factor}
-                              </div>
-                            )}
-
-                            {/* Grounded Dual Evidence Comparison */}
-                            {(c.fact_a || c.fact_b) && (
-                              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginTop: '10px' }}>
-                                {c.fact_a && (
-                                  <div style={{ background: '#ffffff', border: '1px solid var(--border-subtle)', borderRadius: '8px', padding: '12px' }}>
-                                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
-                                      <span style={{ fontSize: '0.76rem', fontWeight: 700, color: 'var(--text-title)' }}>
-                                        {c.fact_a.evidence?.document_name || 'Document A'}
-                                      </span>
-                                      {c.fact_a.evidence?.page_number && (
-                                        <span className="reconciliation-citation-badge page">
-                                          Page {c.fact_a.evidence.page_number}
-                                        </span>
-                                      )}
-                                    </div>
-
-                                    {c.fact_a.evidence?.table_citation && (
-                                      <div style={{ marginBottom: '6px' }}>
-                                        <span className="reconciliation-citation-badge table">
-                                          <Table size={12} /> {c.fact_a.evidence.table_citation}
-                                        </span>
-                                      </div>
-                                    )}
-
-                                    {c.fact_a.evidence?.image_citation && (
-                                      <div style={{ marginBottom: '6px' }}>
-                                        <span className="reconciliation-citation-badge image">
-                                          <Image size={12} /> {c.fact_a.evidence.image_citation}
-                                        </span>
-                                      </div>
-                                    )}
-
-                                    <div style={{ fontSize: '0.86rem', fontWeight: 700, color: 'var(--primary)', margin: '4px 0' }}>
-                                      {c.fact_a.subject} &bull; {c.fact_a.attribute}: {c.fact_a.value}
-                                    </div>
-
-                                    {c.fact_a.evidence?.verbatim_quote && (
-                                      <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', fontStyle: 'italic', margin: 0 }}>
-                                        "{c.fact_a.evidence.verbatim_quote}"
-                                      </p>
-                                    )}
-                                  </div>
-                                )}
-
-                                {c.fact_b && (
-                                  <div style={{ background: '#ffffff', border: '1px solid var(--border-subtle)', borderRadius: '8px', padding: '12px' }}>
-                                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
-                                      <span style={{ fontSize: '0.76rem', fontWeight: 700, color: 'var(--text-title)' }}>
-                                        {c.fact_b.evidence?.document_name || 'Document B'}
-                                      </span>
-                                      {c.fact_b.evidence?.page_number && (
-                                        <span className="reconciliation-citation-badge page">
-                                          Page {c.fact_b.evidence.page_number}
-                                        </span>
-                                      )}
-                                    </div>
-
-                                    {c.fact_b.evidence?.table_citation && (
-                                      <div style={{ marginBottom: '6px' }}>
-                                        <span className="reconciliation-citation-badge table">
-                                          <Table size={12} /> {c.fact_b.evidence.table_citation}
-                                        </span>
-                                      </div>
-                                    )}
-
-                                    {c.fact_b.evidence?.image_citation && (
-                                      <div style={{ marginBottom: '6px' }}>
-                                        <span className="reconciliation-citation-badge image">
-                                          <Image size={12} /> {c.fact_b.evidence.image_citation}
-                                        </span>
-                                      </div>
-                                    )}
-
-                                    <div style={{ fontSize: '0.86rem', fontWeight: 700, color: 'var(--primary)', margin: '4px 0' }}>
-                                      {c.fact_b.subject} &bull; {c.fact_b.attribute}: {c.fact_b.value}
-                                    </div>
-
-                                    {c.fact_b.evidence?.verbatim_quote && (
-                                      <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', fontStyle: 'italic', margin: 0 }}>
-                                        "{c.fact_b.evidence.verbatim_quote}"
-                                      </p>
-                                    )}
-                                  </div>
-                                )}
-                              </div>
-                            )}
-                          </div>
+                      {/* Filter Chips Bar */}
+                      <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '14px' }}>
+                        {[
+                          { id: 'all', label: 'All', count: sessionComparisons.length },
+                          { id: 'corroboration', label: 'Corroboration', count: sessionComparisons.filter(c => c.relationship_type === 'corroboration').length },
+                          { id: 'reconciled', label: 'Reconciled', count: sessionComparisons.filter(c => c.relationship_type === 'reconciled').length },
+                          { id: 'contradiction', label: 'Contradiction', count: sessionComparisons.filter(c => c.relationship_type === 'contradiction').length },
+                          { id: 'extraction_failure', label: 'Handled Edge Cases', count: sessionComparisons.filter(c => c.relationship_type === 'extraction_failure').length }
+                        ].map(f => (
+                          <button
+                            key={f.id}
+                            onClick={() => setReconciliationFilter(f.id)}
+                            style={{
+                              padding: '5px 12px',
+                              borderRadius: '20px',
+                              fontSize: '0.78rem',
+                              fontWeight: 600,
+                              border: '1px solid',
+                              cursor: 'pointer',
+                              transition: 'all 0.15s ease',
+                              background: reconciliationFilter === f.id ? 'var(--primary)' : '#ffffff',
+                              color: reconciliationFilter === f.id ? '#ffffff' : 'var(--text-body)',
+                              borderColor: reconciliationFilter === f.id ? 'var(--primary)' : 'var(--border-subtle)'
+                            }}
+                          >
+                            {f.label} ({f.count})
+                          </button>
                         ))}
+                      </div>
 
-                        {sessionComparisons.length === 0 && (
-                          <div style={{ textAlign: 'center', padding: '30px 10px', color: 'var(--text-muted)' }}>
-                            No cross-document reconciliations yet.<br />
-                            Upload multiple documents with overlapping financial or operational metrics to see automated corroborations and contradictions with exact table and page citations.
+                      {/* Informative Single-Doc Banner */}
+                      {activeSessionObj?.documents?.length <= 1 && (
+                        <div style={{ padding: '12px 16px', background: '#fdf8ef', border: '1px solid #f0e2cc', borderRadius: '10px', marginBottom: '16px', fontSize: '0.82rem', color: '#7a5418', lineHeight: 1.45, display: 'flex', alignItems: 'center', gap: '10px' }}>
+                          <span style={{ fontSize: '1.2rem' }}>💡</span>
+                          <div>
+                            <strong>Intra-Document Verification Mode:</strong> Validating consistency across text statements, tables, reporting scopes (BE vs RE vs Actuals), and accounting notation within this document. Upload a second document to compare cross-document claims!
+                          </div>
+                        </div>
+                      )}
+
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                        {sessionComparisons
+                          .filter(c => reconciliationFilter === 'all' || c.relationship_type === reconciliationFilter)
+                          .map((c, i) => (
+                            <div key={i} style={{ border: '1px solid var(--border-subtle)', borderRadius: '12px', padding: '18px', background: '#faf8f5', boxShadow: '0 2px 8px rgba(0,0,0,0.02)' }}>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                  {c.relationship_type === 'corroboration' && <CheckCircle2 size={17} color="var(--success)" />}
+                                  {c.relationship_type === 'contradiction' && <AlertTriangle size={17} color="var(--danger)" />}
+                                  {c.relationship_type === 'reconciled' && <GitCompare size={17} color="var(--primary)" />}
+                                  {c.relationship_type === 'extraction_failure' && <ShieldAlert size={17} color="#d97706" />}
+                                  <h4 style={{ fontSize: '0.98rem', fontWeight: 700, color: 'var(--text-title)', margin: 0 }}>{c.title}</h4>
+                                </div>
+                                <span style={{
+                                  textTransform: 'uppercase',
+                                  fontSize: '0.72rem',
+                                  fontWeight: 700,
+                                  padding: '4px 10px',
+                                  borderRadius: '4px',
+                                  background: c.relationship_type === 'corroboration' ? 'var(--success-bg)' : c.relationship_type === 'contradiction' ? 'var(--danger-bg)' : c.relationship_type === 'reconciled' ? 'var(--primary-light)' : '#fef3c7',
+                                  color: c.relationship_type === 'corroboration' ? 'var(--success)' : c.relationship_type === 'contradiction' ? 'var(--danger)' : c.relationship_type === 'reconciled' ? 'var(--primary)' : '#b45309'
+                                }}>
+                                  {c.relationship_type.replace('_', ' ')}
+                                </span>
+                              </div>
+
+                              <p style={{ fontSize: '0.88rem', color: 'var(--text-body)', lineHeight: 1.5, marginBottom: '12px' }}>
+                                {c.explanation}
+                              </p>
+
+                              {c.reconciliation_factor && (
+                                <div style={{ fontSize: '0.82rem', background: '#f2ece2', padding: '8px 12px', borderRadius: '6px', color: 'var(--primary)', fontWeight: 600, marginBottom: '12px' }}>
+                                  Resolution: {c.reconciliation_factor}
+                                </div>
+                              )}
+
+                              {/* Grounded Dual Evidence Comparison */}
+                              {(c.fact_a || c.fact_b) && (
+                                <div style={{ display: 'grid', gridTemplateColumns: c.fact_b ? '1fr 1fr' : '1fr', gap: '12px', marginTop: '10px' }}>
+                                  {c.fact_a && (
+                                    <div style={{ background: '#ffffff', border: '1px solid var(--border-subtle)', borderRadius: '8px', padding: '12px' }}>
+                                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
+                                        <span style={{ fontSize: '0.76rem', fontWeight: 700, color: 'var(--text-title)' }}>
+                                          {c.fact_a.evidence?.document_name || 'Document Citation A'}
+                                        </span>
+                                        {c.fact_a.evidence?.page_number && (
+                                          <span className="reconciliation-citation-badge page">
+                                            Page {c.fact_a.evidence.page_number}
+                                          </span>
+                                        )}
+                                      </div>
+
+                                      {c.fact_a.evidence?.table_citation && (
+                                        <div style={{ marginBottom: '6px' }}>
+                                          <span className="reconciliation-citation-badge table">
+                                            <Table size={12} /> {c.fact_a.evidence.table_citation}
+                                          </span>
+                                        </div>
+                                      )}
+
+                                      {c.fact_a.evidence?.image_citation && (
+                                        <div style={{ marginBottom: '6px' }}>
+                                          <span className="reconciliation-citation-badge image">
+                                            <Image size={12} /> {c.fact_a.evidence.image_citation}
+                                          </span>
+                                        </div>
+                                      )}
+
+                                      <div style={{ fontSize: '0.86rem', fontWeight: 700, color: 'var(--primary)', margin: '4px 0' }}>
+                                        {c.fact_a.subject} &bull; {c.fact_a.attribute}: {c.fact_a.value}
+                                      </div>
+
+                                      {c.fact_a.evidence?.verbatim_quote && (
+                                        <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', fontStyle: 'italic', margin: 0, lineHeight: 1.4 }}>
+                                          "{c.fact_a.evidence.verbatim_quote}"
+                                        </p>
+                                      )}
+                                    </div>
+                                  )}
+
+                                  {c.fact_b && (
+                                    <div style={{ background: '#ffffff', border: '1px solid var(--border-subtle)', borderRadius: '8px', padding: '12px' }}>
+                                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
+                                        <span style={{ fontSize: '0.76rem', fontWeight: 700, color: 'var(--text-title)' }}>
+                                          {c.fact_b.evidence?.document_name || 'Document Citation B'}
+                                        </span>
+                                        {c.fact_b.evidence?.page_number && (
+                                          <span className="reconciliation-citation-badge page">
+                                            Page {c.fact_b.evidence.page_number}
+                                          </span>
+                                        )}
+                                      </div>
+
+                                      {c.fact_b.evidence?.table_citation && (
+                                        <div style={{ marginBottom: '6px' }}>
+                                          <span className="reconciliation-citation-badge table">
+                                            <Table size={12} /> {c.fact_b.evidence.table_citation}
+                                          </span>
+                                        </div>
+                                      )}
+
+                                      {c.fact_b.evidence?.image_citation && (
+                                        <div style={{ marginBottom: '6px' }}>
+                                          <span className="reconciliation-citation-badge image">
+                                            <Image size={12} /> {c.fact_b.evidence.image_citation}
+                                          </span>
+                                        </div>
+                                      )}
+
+                                      <div style={{ fontSize: '0.86rem', fontWeight: 700, color: 'var(--primary)', margin: '4px 0' }}>
+                                        {c.fact_b.subject} &bull; {c.fact_b.attribute}: {c.fact_b.value}
+                                      </div>
+
+                                      {c.fact_b.evidence?.verbatim_quote && (
+                                        <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', fontStyle: 'italic', margin: 0, lineHeight: 1.4 }}>
+                                          "{c.fact_b.evidence.verbatim_quote}"
+                                        </p>
+                                      )}
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          ))}
+
+                        {sessionComparisons.filter(c => reconciliationFilter === 'all' || c.relationship_type === reconciliationFilter).length === 0 && (
+                          <div style={{ textAlign: 'center', padding: '30px 10px', color: 'var(--text-muted)', background: '#faf8f5', borderRadius: '10px', border: '1px dashed var(--border-subtle)' }}>
+                            No comparisons matching '{reconciliationFilter}' found in this workspace.
                           </div>
                         )}
                       </div>
@@ -1507,6 +1722,62 @@ export default function App() {
               >
                 <Trash2 size={16} /> Delete Document
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Figure Lightbox / Zoom Modal */}
+      {previewFigure && (
+        <div className="modal-backdrop" onClick={() => setPreviewFigure(null)} style={{ background: 'rgba(0, 0, 0, 0.82)', backdropFilter: 'blur(6px)', zIndex: 1100 }}>
+          <div className="custom-modal-card" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '960px', width: '92vw', maxHeight: '92vh', display: 'flex', flexDirection: 'column', padding: '0', overflow: 'hidden' }}>
+            <div className="custom-modal-header" style={{ padding: '16px 20px', borderBottom: '1px solid var(--border-subtle)', background: '#ffffff' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <span className="reconciliation-citation-badge page" style={{ fontSize: '0.8rem', padding: '3px 8px' }}>
+                  Page {previewFigure.page_number}
+                </span>
+                <h3 style={{ fontSize: '1rem', fontWeight: 700, margin: 0, color: 'var(--text-title)' }}>
+                  {previewFigure.caption || previewFigure.figure_id}
+                </h3>
+              </div>
+              <button
+                className="custom-modal-close-btn"
+                onClick={() => setPreviewFigure(null)}
+              >
+                <X size={20} />
+              </button>
+            </div>
+            <div style={{ flex: 1, overflowY: 'auto', background: '#f8f6f0', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '24px' }}>
+              <img
+                src={previewFigure.url}
+                alt={previewFigure.caption || previewFigure.figure_id}
+                style={{ maxWidth: '100%', maxHeight: '68vh', objectFit: 'contain', borderRadius: '6px', boxShadow: '0 4px 20px rgba(0,0,0,0.12)' }}
+              />
+            </div>
+            <div className="custom-modal-footer" style={{ padding: '12px 20px', background: '#ffffff', borderTop: '1px solid var(--border-subtle)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                {previewFigure.width && previewFigure.height ? `${previewFigure.width} × ${previewFigure.height} px • ` : ''}
+                {previewFigure.type === 'chart' ? 'Vector Chart Clip (150 DPI)' : 'Embedded Visual Asset'}
+              </span>
+              <div style={{ display: 'flex', gap: '10px' }}>
+                <a
+                  href={previewFigure.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="modal-btn-cancel"
+                  style={{ textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: '6px' }}
+                >
+                  <ExternalLink size={15} /> Open Full Size
+                </a>
+                <a
+                  href={previewFigure.url}
+                  download={`${previewFigure.figure_id}.png`}
+                  className="modal-btn-primary"
+                  style={{ textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: '6px', background: 'var(--primary)', color: '#fff', padding: '8px 14px', borderRadius: '8px', fontSize: '0.85rem', fontWeight: 600 }}
+                >
+                  <Download size={15} /> Download PNG
+                </a>
+              </div>
             </div>
           </div>
         </div>

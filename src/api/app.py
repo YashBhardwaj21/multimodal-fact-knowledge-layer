@@ -301,7 +301,11 @@ def get_session_tables(session_id: str):
 
 @app.get("/api/sessions/{session_id}/figures")
 def get_session_figures(session_id: str):
-    """Retrieve list of extracted figures and diagrams."""
+    """Retrieve list of extracted figures and diagrams with rich metadata."""
+    meta_list = object_store.get_figures_meta(session_id)
+    if meta_list:
+        return meta_list
+
     figs_dir = object_store.get_figures_dir(session_id)
     figures = []
     for fig_file in figs_dir.glob("*/*.png"):
@@ -310,11 +314,119 @@ def get_session_figures(session_id: str):
         figures.append({
             "figure_id": fig_id,
             "document": doc_stem,
+            "document_name": f"{doc_stem}.pdf",
             "file_name": fig_file.name,
             "url": f"/api/sessions/{session_id}/figures/{doc_stem}/{fig_id}",
+            "caption": f"Visual Asset: {fig_id.replace('_', ' ').title()}",
             "size_kb": round(fig_file.stat().st_size / 1024, 1)
         })
     return figures
+
+
+@app.post("/api/sessions/{session_id}/reconcile")
+def recompute_reconciliation(session_id: str):
+    """Recompute cross-document and intra-document fact reconciliation."""
+    session = session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Workspace session not found")
+    all_session_facts = session.knowledge_layer.facts
+    all_session_docs = sorted(list(set([d["filename"] for d in session.documents])))
+    session.knowledge_layer = reconciler.reconcile(all_session_facts, all_session_docs)
+    session_manager.save_knowledge_layer(session_id, session.knowledge_layer)
+    return {
+        "status": "success",
+        "total_facts": len(all_session_facts),
+        "comparisons_count": len(session.knowledge_layer.comparisons),
+        "comparisons": [c.to_dict() for c in session.knowledge_layer.comparisons],
+        "statistics": session.knowledge_layer.statistics
+    }
+
+
+@app.post("/api/sessions/{session_id}/reprocess")
+def reprocess_session_documents(session_id: str):
+    """Reprocess all documents in this session with the upgraded figure & fact extractors."""
+    session = session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Workspace session not found")
+
+    docs_dir = object_store.get_documents_dir(session_id)
+    pdf_files = list(docs_dir.glob("*.pdf"))
+    processed = []
+
+    for pdf_path in pdf_files:
+        fname = pdf_path.name
+        canonical_doc = pdf_loader.load_canonical_document(
+            pdf_path=str(pdf_path),
+            session_id=session_id,
+            render_thumbnails=False
+        )
+
+        figures = figure_extractor.extract_figures_from_pdf(
+            pdf_path=str(pdf_path),
+            session_id=session_id,
+            max_pages=None
+        )
+        canonical_doc.figures_count = len(figures)
+
+        new_facts = fact_extractor.extract_from_pages(canonical_doc.pages)
+
+        # Update canonical doc cache
+        if session_id not in SESSION_CANONICAL_DOCS:
+            SESSION_CANONICAL_DOCS[session_id] = {}
+        SESSION_CANONICAL_DOCS[session_id][fname] = canonical_doc
+
+        # Replace facts for this document
+        remaining_facts = [f for f in session.knowledge_layer.facts if f.evidence and f.evidence.document_name != fname]
+        all_session_facts = remaining_facts + new_facts
+        session.knowledge_layer.facts = all_session_facts
+
+        # Update or add doc entry in session
+        existing_doc = next((d for d in session.documents if d.get("filename") == fname), None)
+        if existing_doc:
+            existing_doc["figures_count"] = len(figures)
+            existing_doc["blocks_count"] = len(canonical_doc.blocks)
+            existing_doc["tables_count"] = len(canonical_doc.tables)
+            existing_doc["summary"] = f"Processed {canonical_doc.total_pages} pages with {len(canonical_doc.blocks)} text blocks, {len(canonical_doc.tables)} structured tables, and {len(figures)} figures."
+        else:
+            doc_entry = {
+                "doc_id": canonical_doc.doc_id,
+                "filename": fname,
+                "title": canonical_doc.title,
+                "pages_count": canonical_doc.total_pages,
+                "blocks_count": len(canonical_doc.blocks),
+                "tables_count": len(canonical_doc.tables),
+                "figures_count": canonical_doc.figures_count,
+                "summary": f"Processed {canonical_doc.total_pages} pages with {len(canonical_doc.blocks)} text blocks, {len(canonical_doc.tables)} structured tables, and {len(figures)} figures.",
+                "tags": canonical_doc.tags,
+                "status": "Processed",
+                "processed_time": "Just now",
+                "size_bytes": pdf_path.stat().st_size
+            }
+            session.documents.append(doc_entry)
+
+        # Persist to database
+        session_manager.add_document(
+            session_id=session_id,
+            doc_entry=existing_doc or doc_entry,
+            pages=canonical_doc.pages,
+            facts=new_facts,
+            comparisons=[]
+        )
+        session_manager.update_document_figures_count(session_id, fname, len(figures))
+
+        processed.append({"filename": fname, "figures": len(figures), "facts": len(new_facts)})
+
+    all_session_docs = sorted(list(set([d["filename"] for d in session.documents])))
+    session.knowledge_layer = reconciler.reconcile(session.knowledge_layer.facts, all_session_docs)
+    session_manager.save_knowledge_layer(session_id, session.knowledge_layer)
+
+    return {
+        "status": "reprocessed",
+        "documents": processed,
+        "total_figures": sum(p["figures"] for p in processed),
+        "total_facts": len(session.knowledge_layer.facts),
+        "comparisons": len(session.knowledge_layer.comparisons)
+    }
 
 
 @app.get("/api/sessions/{session_id}/structure")
@@ -367,15 +479,24 @@ if FRONTEND_DIST.exists():
     app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST / "assets")), name="assets")
 
 
-@app.get("/{full_path:path}", response_class=HTMLResponse)
+@app.get("/{full_path:path}")
 def serve_spa(full_path: str):
     if full_path.startswith("api/"):
         raise HTTPException(status_code=404, detail="API endpoint not found")
 
     if FRONTEND_DIST.exists():
+        if full_path:
+            requested_file = (FRONTEND_DIST / full_path).resolve()
+            dist_resolved = FRONTEND_DIST.resolve()
+            try:
+                requested_file.relative_to(dist_resolved)
+                if requested_file.is_file():
+                    return FileResponse(requested_file)
+            except ValueError:
+                pass
+
         index_file = FRONTEND_DIST / "index.html"
         if index_file.exists():
-            with open(index_file, "r", encoding="utf-8") as f:
-                return f.read()
+            return FileResponse(index_file)
 
-    return "<h1>Document Intelligence</h1><p>Frontend is building...</p>"
+    return HTMLResponse("<h1>Document Intelligence</h1><p>Frontend is building...</p>")
