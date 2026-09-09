@@ -252,33 +252,6 @@ python tests/test_arbitrary_e2e.py
 
 ---
 
-## Limitations and Next Steps
-
-### Current Limitations
-1. **Heuristic Parsing on Borderless Financial Tables**: While explicitly ruled tables extract cleanly into structured Markdown, borderless multi-column disclosures (such as nested financial statement footnotes, balance sheets, and segmented accounts) rely on whitespace clustering heuristics in PyMuPDF. When columns lack explicit vertical dividers or feature multi-line wrapping, column alignment can occasionally shift or merge adjacent numeric columns.
-2. **Caption-Dependent Visual Figure Detection**: Visual figure and chart segmentation identifies regions by combining vector drawing path densities with proximity to formal caption prefixes (`Chart ...`, `Figure ...`, `Exhibit ...`). Standalone infographic callouts, KPI highlight cards, or figures lacking standard academic/regulatory captions can be bypassed to prevent false-positive decorative noise.
-3. **Decoupled Local VLM for Scanned Artifacts**: The primary ingestion pipeline is optimized for fast, zero-dependency CPU extraction on searchable digital PDFs. While the repository includes a complete local vision-language OCR pipeline using `Qwen/Qwen3-VL-4B-Instruct` (`src/ocr/ocr_extractor.py`) for scanned image-only documents, it requires an NVIDIA GPU with 16GB+ VRAM and is intentionally decoupled from the default lightweight CPU web server flow.
-4. **All-Pairs Reconciliation Scaling**: The current reconciliation engine performs pairwise fact comparison within semantic attribute clusters ($O(N^2)$ within clusters). While performant for typical workspace document sets (hundreds of facts across 5–10 filings), scaling to enterprise repositories containing thousands of cross-filing metrics requires map-reduce clustering and approximate nearest-neighbor partitioning to bound memory and CPU overhead.
-5. **CPU Vector Embedding Latency on Large Documents**: When ingesting 100+ page documents with thousands of text blocks, local ONNX vector embedding generation in ChromaDB takes 15–45 seconds on standard CPU hardware. While the server remains responsive via worker threadpools and the frontend displays a real-time multi-stage progress monitor, batch GPU acceleration or async background queueing (e.g., Celery/Redis) would further streamline massive batch ingestion.
-
-### Next Steps & Roadmap
-1. **Hybrid Vision-Language Table Parsers**: Integrate lightweight vision-based table transformers (e.g. Table-Transformer or Microsoft UniLM / PaddleOCR-v4) to achieve state-of-the-art cell segmentation on borderless, nested financial disclosures.
-2. **Interactive Temporal Knowledge Graph**: Enhance the interactive D3/SVG Knowledge Graph with a temporal scrubber timeline, enabling analysts to trace the quarter-over-quarter evolution and restatements of specific macroeconomic or corporate metrics across fiscal cycles.
-3. **Cross-Workspace Discrepancy Matrices**: Enable side-by-side discrepancy auditing between entire workspaces (e.g., benchmarking Competitor A vs. Competitor B financial filings or comparing IMF Article IV projections against World Bank country reports).
-4. **Export & Compliance Integration**: Provide automated export of verified fact reconciliation matrices to standardized XBRL, audit-ready Excel (`.xlsx`) workbooks with embedded citation hyperlinks, and structured CSV/JSON-LD for downstream analytics.
-5. **In-Situ PDF Canvas Redlining**: Add visual PDF document redlining to highlight verbatim evidence spans directly on the rendered PDF canvas inside the Document Viewer.
-
----
-
-## Additional Notes
-
-- **Self-Healing Adaptive LLM Resolution**: If a Google API key does not have access to legacy `gemini-1.5-flash` endpoints, the system automatically resolves to `gemini-3.6-flash` without throwing unhandled exceptions.
-- **Zero-Hallucination Prompting**: Multimodal chat prompts explicitly instruct the vision model to transcribe exact visual numbers, legends, and axes directly from attached image crops while forbidding open extrapolation.
-- **No-Key Operation**: The system operates with full deterministic capability out-of-the-box. Fact extraction, table viewing, figure rendering, and reconciliation matrices function completely without third-party API credentials.
-- **Persistence Across Restarts**: Extracted structured tables, figure metadata manifests, and SQLite relations are persisted in `data/object_store/` and `data/database/`, surviving server restarts.
-
----
-
 ## API Reference
 
 Base URL: `http://localhost:8000`
