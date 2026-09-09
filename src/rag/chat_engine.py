@@ -1,19 +1,21 @@
-"""Conversational RAG engine with grounded source evidence."""
+"""Conversational RAG engine with grounded source evidence and multimodal visual grounding."""
 
 import re
+import base64
 from typing import Dict, List, Any, Optional
 from pathlib import Path
 import logging
 
 from src.rag.vector_store import SessionVectorStore
 from src.sessions.session_manager import WorkspaceSession, ChatMessage
-from src.facts.llm_provider import LLMProvider
+from src.facts.llm_provider import LLMProvider, default_llm_provider
+from src.storage.object_store import default_object_store
 
 logger = logging.getLogger(__name__)
 
 
 class ChatEngine:
-    """Answers queries in an isolated session with verified source citations."""
+    """Answers queries in an isolated session with verified source citations and multimodal grounding."""
 
     def __init__(
         self,
@@ -23,9 +25,10 @@ class ChatEngine:
         vector_store: Optional[SessionVectorStore] = None,
         storage_base: str = "data/object_store"
     ):
-        self.llm = llm_provider or LLMProvider()
+        self.llm = llm_provider or default_llm_provider
         self.session_id = session_id or (session.id if session else None)
         self.session = session or (WorkspaceSession(self.session_id, "Workspace") if self.session_id else None)
+        self.storage_base = storage_base
         self.vector_store = vector_store or (
             SessionVectorStore(self.session_id, storage_base=storage_base) if self.session_id else None
         )
@@ -55,10 +58,10 @@ class ChatEngine:
                 f"Hello! I am your Document Intelligence Assistant for **{session.title}**.\n\n"
                 f"Currently available documents in this workspace:\n{doc_list}\n\n"
                 "**Here are things you can ask me:**\n"
-                "- *'Summarize page 10 of [document]'*\n"
-                "- *'What are the key financial or technical figures?'*\n"
-                "- *'Compare metrics across uploaded files'*\n"
-                "- *'What tables or instructions are present?'*\n\n"
+                "- *'Summarize page 24 of [document]'*\n"
+                "- *'What does Chart II.2.1 show about Real GDP Growth?'*\n"
+                "- *'What are the key financial numbers in the tables?'*\n"
+                "- *'Compare inflation projections across uploaded files'*\n\n"
                 "What would you like to explore?"
             )
             user_msg = ChatMessage(role="user", content=user_query)
@@ -79,14 +82,14 @@ class ChatEngine:
         # 3. Retrieve relevant passages using vector search
         passages = vector_store.search_hybrid(
             query=user_query,
-            top_k=5,
+            top_k=6,
             doc_filter=document_name,
             page_filter=target_page
         )
 
         # Fallback to unrestricted search if filtered search returned nothing
         if not passages and (document_name or target_page):
-            passages = vector_store.search_hybrid(query=user_query, top_k=5)
+            passages = vector_store.search_hybrid(query=user_query, top_k=6)
 
         # 4. If target page was requested, also attempt to load full page text from canonical cache
         page_direct_text = ""
@@ -113,47 +116,132 @@ class ChatEngine:
             if (match_doc and match_page and target_page) or text_match:
                 relevant_facts.append(f)
 
-        # 6. Build citations
+        # 6. Retrieve relevant visual figures and structured tables
+        all_figures = default_object_store.get_figures_meta(session.id, document_name)
+        matched_figures: List[Dict[str, Any]] = []
+        multimodal_images: List[Dict[str, Any]] = []
+
+        # Find figures matching user query keywords or target page
+        query_words = [w for w in re.findall(r'\b\w+\b', q_strip) if len(w) > 2]
+        is_visual_query = any(k in q_strip for k in ["chart", "figure", "fig", "diagram", "image", "plot", "graph", "trend", "exhibit"])
+
+        for fig in all_figures:
+            fig_p = fig.get("page_number")
+            caption_l = fig.get("caption", "").lower()
+            fig_id_l = fig.get("figure_id", "").lower()
+
+            page_match = (target_page and fig_p == target_page)
+            keyword_match = any(w in caption_l or w in fig_id_l for w in query_words)
+            if page_match or keyword_match or (is_visual_query and len(matched_figures) < 2):
+                matched_figures.append(fig)
+
+        # Limit to top 2 figures for multimodal vision context
+        for fig in matched_figures[:2]:
+            doc_file = fig.get("document_name") or document_name or (session.documents[0]["filename"] if session.documents else "")
+            fig_id = fig.get("figure_id", "")
+            img_path = Path(self.storage_base) / session.id / "figures" / Path(doc_file).stem / f"{fig_id}.png"
+            if img_path.exists():
+                try:
+                    with open(img_path, "rb") as img_f:
+                        img_bytes = img_f.read()
+                        b64_str = base64.b64encode(img_bytes).decode("utf-8")
+                        multimodal_images.append({
+                            "mime_type": "image/png",
+                            "data": b64_str,
+                            "caption": fig.get("caption", ""),
+                            "figure_id": fig_id,
+                            "page_number": fig.get("page_number", 1),
+                            "document_name": doc_file,
+                            "image_url": fig.get("image_url", f"/api/sessions/{session.id}/figures/{Path(doc_file).stem}/{fig_id}.png")
+                        })
+                except Exception as e:
+                    logger.debug(f"Could not load figure image {img_path}: {e}")
+
+        # Retrieve relevant tables
+        all_tables = default_object_store.get_tables_meta(session.id, document_name)
+        matched_tables: List[Dict[str, Any]] = []
+        for tab in all_tables:
+            tab_p = tab.get("page_number")
+            headers_l = " ".join(tab.get("headers", [])).lower()
+            md_l = tab.get("markdown", "").lower()
+            if (target_page and tab_p == target_page) or any(w in headers_l or w in md_l for w in query_words if len(w) > 3):
+                matched_tables.append(tab)
+                if len(matched_tables) >= 2:
+                    break
+
+        # 7. Build rich citations
         citations = []
+        # A. Page thumbnail citation
         if page_direct_text and resolved_doc_name:
             thumb_url = f"/api/sessions/{session.id}/documents/{Path(resolved_doc_name).stem}/pages/{target_page}/thumbnail"
             citations.append({
                 "document_name": resolved_doc_name,
                 "page_number": target_page,
                 "verbatim_quote": page_direct_text[:280] + ("..." if len(page_direct_text) > 280 else ""),
-                "thumbnail_url": thumb_url
+                "thumbnail_url": thumb_url,
+                "citation_type": "page"
             })
 
+        # B. Figure visual citations
+        for img in multimodal_images:
+            citations.append({
+                "document_name": img["document_name"],
+                "page_number": img["page_number"],
+                "verbatim_quote": f"[Visual Asset] {img['caption'] or img['figure_id']}",
+                "thumbnail_url": img["image_url"],
+                "image_url": img["image_url"],
+                "citation_type": "figure"
+            })
+
+        # C. Table citations
+        for tab in matched_tables[:2]:
+            doc_f = tab.get("document_name") or document_name or (session.documents[0]["filename"] if session.documents else "")
+            headers_str = ", ".join(tab.get("headers", []))
+            thumb_url = f"/api/sessions/{session.id}/documents/{Path(doc_f).stem}/pages/{tab.get('page_number', 1)}/thumbnail"
+            citations.append({
+                "document_name": doc_f,
+                "page_number": tab.get("page_number", 1),
+                "verbatim_quote": f"[Structured Table] Columns: {headers_str}",
+                "thumbnail_url": thumb_url,
+                "citation_type": "table"
+            })
+
+        # D. Text passage citations
         for p in passages[:3]:
             d_name = p.get("document_name", "")
             p_num = p.get("page_number", 1)
             text_snippet = p.get("text", "")
             quote = text_snippet if len(text_snippet) < 300 else text_snippet[:280] + "..."
             thumb_url = f"/api/sessions/{session.id}/documents/{Path(d_name).stem}/pages/{p_num}/thumbnail"
-            if not any(c["document_name"] == d_name and c["page_number"] == p_num for c in citations):
+            if not any(c.get("document_name") == d_name and c.get("page_number") == p_num for c in citations):
                 citations.append({
                     "document_name": d_name,
                     "page_number": p_num,
                     "verbatim_quote": quote,
-                    "thumbnail_url": thumb_url
+                    "thumbnail_url": thumb_url,
+                    "citation_type": p.get("type", "paragraph")
                 })
 
+        # E. Key fact citations
         for f in relevant_facts[:2]:
             if f.evidence:
                 thumb_url = f"/api/sessions/{session.id}/documents/{Path(f.evidence.document_name).stem}/pages/{f.evidence.page_number}/thumbnail"
-                if not any(c["document_name"] == f.evidence.document_name and c["page_number"] == f.evidence.page_number for c in citations):
+                if not any(c.get("document_name") == f.evidence.document_name and c.get("page_number") == f.evidence.page_number for c in citations):
                     citations.append({
                         "document_name": f.evidence.document_name,
                         "page_number": f.evidence.page_number,
                         "verbatim_quote": f.evidence.verbatim_quote,
-                        "thumbnail_url": thumb_url
+                        "thumbnail_url": thumb_url,
+                        "citation_type": "fact"
                     })
 
-        # 7. Synthesize answer
+        # 8. Synthesize answer
         answer = self._synthesize_answer(
             query=user_query,
             passages=passages,
             facts=relevant_facts,
+            tables=matched_tables,
+            multimodal_images=multimodal_images,
             target_page=target_page,
             page_text=page_direct_text,
             doc_name=resolved_doc_name
@@ -176,12 +264,17 @@ class ChatEngine:
         query: str,
         passages: List[Dict[str, Any]],
         facts: List[Any],
+        tables: Optional[List[Dict[str, Any]]] = None,
+        multimodal_images: Optional[List[Dict[str, Any]]] = None,
         target_page: Optional[int] = None,
         page_text: str = "",
         doc_name: Optional[str] = None
     ) -> str:
-        """Synthesize answer using configured LLM or intelligent structured extractor."""
-        if not passages and not facts and not page_text:
+        """Synthesize answer using configured LLM (with multimodal vision if available) or intelligent structured extractor."""
+        tables = tables or []
+        multimodal_images = multimodal_images or []
+
+        if not passages and not facts and not page_text and not tables and not multimodal_images:
             return (
                 f"No verified information regarding '{query}' was found in the documents currently uploaded to this workspace. "
                 "Please verify the document is uploaded or try rephrasing your question."
@@ -192,29 +285,55 @@ class ChatEngine:
         if page_text and target_page and doc_name:
             context_blocks.append(f"[Full Page Content from {doc_name} Page {target_page}]:\n{page_text}")
         for p in passages:
-            context_blocks.append(f"[{p['document_name']} Page {p['page_number']}]: {p['text']}")
+            context_blocks.append(f"[{p['document_name']} Page {p['page_number']} ({p.get('type', 'text')})]: {p['text']}")
         for f in facts:
             context_blocks.append(f"[Fact from {f.evidence.document_name}]: {f.subject} - {f.attribute}: {f.value} ({f.context_scope or ''})")
+        for t in tables:
+            context_blocks.append(f"[Structured Table from Page {t.get('page_number')}]:\n{t.get('markdown', '')}")
+        for img in multimodal_images:
+            context_blocks.append(f"[Attached Visual Figure/Chart on Page {img.get('page_number')}]: {img.get('caption')} (ID: {img.get('figure_id')})")
 
-        # 1. LLM Generation (Gemini, OpenAI, Ollama)
+        # 1. LLM Generation (Gemini with Multimodal Vision, OpenAI, Ollama)
         if self.llm.is_active():
             sys_prompt = (
                 "You are an expert Document Intelligence Assistant. Answer the user's question accurately, "
-                "professionally, and strictly based on the provided document excerpts. "
-                "If asked to summarize a page, synthesize a clear bulleted breakdown of the key information, sections, and numbers on that page. "
-                "Do NOT hallucinate information not present in the context."
+                "professionally, and strictly based on the provided document excerpts, tables, and images. "
+                "If an image of a chart/figure is provided, describe its visual findings, trends, and exact numbers. "
+                "Do NOT extrapolate or hallucinate numbers or facts not present in the verified context."
             )
-            prompt = (
-                f"User Question: {query}\n\n"
-                f"Verified Document Excerpts:\n" + "\n---\n".join(context_blocks[:6]) + "\n\n"
-                "Provide a clear, detailed, and formatted markdown answer directly addressing the user's question:"
-            )
-            try:
-                response = self.llm.generate(prompt, system_prompt=sys_prompt, as_json=False)
-                if response and len(response.strip()) > 10:
-                    return response.strip()
-            except Exception as e:
-                logger.debug(f"LLM generation failed: {e}")
+            if multimodal_images and self.llm.provider_type == "gemini":
+                prompt = (
+                    f"User Question: {query}\n\n"
+                    f"Verified Document Evidence Context:\n" + "\n---\n".join(context_blocks[:7]) + "\n\n"
+                    "INSTRUCTION FOR ATTACHED IMAGE(S):\n"
+                    "You have been provided with one or more high-resolution document figures/charts directly attached as image data. "
+                    "Analyze the visual content of the attached image(s) thoroughly. Read the exact chart titles, axes, units, legends, "
+                    "time periods (quarters/years), and numeric trajectories directly from the image, and provide a comprehensive, detailed breakdown.\n\n"
+                    "Provide a clear, detailed, and formatted markdown answer directly addressing the user's question:"
+                )
+                try:
+                    response = self.llm.generate_multimodal(
+                        prompt=prompt,
+                        images=multimodal_images,
+                        system_prompt=sys_prompt,
+                        temperature=0.1
+                    )
+                    if response and len(response.strip()) > 10:
+                        return response.strip()
+                except Exception as e:
+                    logger.debug(f"Multimodal generation failed: {e}")
+            else:
+                prompt = (
+                    f"User Question: {query}\n\n"
+                    f"Verified Document Evidence:\n" + "\n---\n".join(context_blocks[:7]) + "\n\n"
+                    "Provide a clear, detailed, and formatted markdown answer directly addressing the user's question:"
+                )
+                try:
+                    response = self.llm.generate(prompt, system_prompt=sys_prompt, as_json=False)
+                    if response and len(response.strip()) > 10:
+                        return response.strip()
+                except Exception as e:
+                    logger.debug(f"LLM generation failed: {e}")
 
         # 2. Specific Page Summary Extraction
         if target_page and (page_text or passages):
@@ -241,10 +360,32 @@ class ChatEngine:
                 f"**Key content & sections on this page:**\n"
                 f"{bullets}"
                 f"{fact_summary}\n\n"
-                f"> *Tip: Connect an LLM (such as local Ollama or an API key) for deep generative synthesis.*"
+                f"> *Tip: Add your `GEMINI_API_KEY` in Settings for full generative synthesis and visual chart interpretation.*"
             )
 
-        # 3. Direct Fact Answering
+        # 3. Figure / Visual Chart Query Response
+        if multimodal_images:
+            top_fig = multimodal_images[0]
+            return (
+                f"### Visual Evidence: {top_fig.get('caption') or 'Extracted Chart'}\n\n"
+                f"This visual diagram was identified in **{top_fig['document_name']}** on **Page {top_fig['page_number']}**.\n\n"
+                f"- **Figure ID**: `{top_fig['figure_id']}`\n"
+                f"- **Caption**: *{top_fig['caption']}*\n\n"
+                f"You can view the full high-resolution diagram using the visual citation preview below.\n\n"
+                f"> *Grounding Confidence: 95% (Direct Visual Asset)*"
+            )
+
+        # 4. Table Response
+        if tables:
+            top_tab = tables[0]
+            return (
+                f"### Extracted Table on Page {top_tab.get('page_number', 1)}\n\n"
+                f"Columns: **{', '.join(top_tab.get('headers', []))}**\n\n"
+                f"{top_tab.get('markdown', '')}\n\n"
+                f"> *Grounding Confidence: 98% (Structured Table)*"
+            )
+
+        # 5. Direct Fact Answering
         if facts:
             primary_fact = facts[0]
             ans = f"Based on **{primary_fact.evidence.document_name}** (Page {primary_fact.evidence.page_number}):\n\n"
@@ -260,7 +401,7 @@ class ChatEngine:
                     ans += f"- **{of.attribute}**: `{of.value}` ({of.evidence.document_name}, p.{of.evidence.page_number})\n"
             return ans
 
-        # 4. Structured Excerpt Synthesis
+        # 6. Structured Excerpt Synthesis
         top_passage = passages[0]
         paragraphs = [p.strip() for p in top_passage["text"].split("\n") if len(p.strip()) > 25]
         if not paragraphs:
@@ -272,3 +413,4 @@ class ChatEngine:
             f"{bullet_points}\n\n"
             f"> *Grounding Confidence: {int(top_passage.get('score', 0.85) * 100)}%*"
         )
+

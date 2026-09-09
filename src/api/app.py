@@ -21,6 +21,7 @@ from src.reconciliation.engine import ReconciliationEngine
 from src.facts.models import KnowledgeLayer, RelationshipType
 from src.rag.vector_store import SessionVectorStore
 from src.rag.chat_engine import ChatEngine
+from src.facts.llm_provider import default_llm_provider
 
 app = FastAPI(
     title="Document Intelligence API",
@@ -150,10 +151,24 @@ async def upload_document(session_id: str, file: UploadFile = File(...)):
 
         new_facts = fact_extractor.extract_from_pages(canonical_doc.pages)
 
+        # Save tables to persistent storage
+        tables_dicts = [t.to_dict() for t in canonical_doc.tables]
+        for td in tables_dicts:
+            td["document_name"] = file.filename
+        object_store.save_tables_meta(session_id, file.filename, tables_dicts)
+
         vstore = get_session_vector_store(session_id)
         vstore.add_blocks(
             doc_name=file.filename,
             blocks=[b.to_dict() for b in canonical_doc.blocks]
+        )
+        vstore.add_tables(
+            doc_name=file.filename,
+            tables=tables_dicts
+        )
+        vstore.add_figures(
+            doc_name=file.filename,
+            figures=figures
         )
 
         doc_entry = {
@@ -253,12 +268,13 @@ def get_page_thumbnail(session_id: str, doc_stem: str, page_num: int):
     return JSONResponse(status_code=404, content={"detail": "Thumbnail not found"})
 
 
-@app.get("/api/sessions/{session_id}/figures/{doc_stem}/{fig_id}")
+@app.get("/api/sessions/{session_id}/figures/{doc_stem}/{fig_id:path}")
 def get_figure_image(session_id: str, doc_stem: str, fig_id: str):
-    """Serve an extracted figure image."""
-    fig_path = object_store.get_figures_dir(session_id) / doc_stem / f"{fig_id}.png"
+    """Serve an extracted figure image (handles fig_id with or without .png)."""
+    clean_id = fig_id[:-4] if fig_id.endswith(".png") else fig_id
+    fig_path = object_store.get_figures_dir(session_id) / doc_stem / f"{clean_id}.png"
     if fig_path.exists():
-        return FileResponse(str(fig_path), media_type="image/png")
+        return FileResponse(fig_path, media_type="image/png")
     return JSONResponse(status_code=404, content={"detail": "Figure not found"})
 
 
@@ -296,7 +312,11 @@ def get_session_tables(session_id: str):
             td = t.to_dict()
             td["document_name"] = doc_name
             all_tables.append(td)
-    return all_tables
+    if all_tables:
+        return all_tables
+
+    # Fallback to persistent storage
+    return object_store.get_tables_meta(session_id)
 
 
 @app.get("/api/sessions/{session_id}/figures")
@@ -404,6 +424,27 @@ def reprocess_session_documents(session_id: str):
             }
             session.documents.append(doc_entry)
 
+        # Persist tables to object storage
+        tables_dicts = [t.to_dict() for t in canonical_doc.tables]
+        for td in tables_dicts:
+            td["document_name"] = fname
+        object_store.save_tables_meta(session_id, fname, tables_dicts)
+
+        # Index text blocks, tables, and figures into session vector store
+        vstore = get_session_vector_store(session_id)
+        vstore.add_blocks(
+            doc_name=fname,
+            blocks=[b.to_dict() for b in canonical_doc.blocks]
+        )
+        vstore.add_tables(
+            doc_name=fname,
+            tables=tables_dicts
+        )
+        vstore.add_figures(
+            doc_name=fname,
+            figures=figures
+        )
+
         # Persist to database
         session_manager.add_document(
             session_id=session_id,
@@ -414,7 +455,7 @@ def reprocess_session_documents(session_id: str):
         )
         session_manager.update_document_figures_count(session_id, fname, len(figures))
 
-        processed.append({"filename": fname, "figures": len(figures), "facts": len(new_facts)})
+        processed.append({"filename": fname, "figures": len(figures), "tables": len(canonical_doc.tables), "facts": len(new_facts)})
 
     all_session_docs = sorted(list(set([d["filename"] for d in session.documents])))
     session.knowledge_layer = reconciler.reconcile(session.knowledge_layer.facts, all_session_docs)
@@ -473,10 +514,33 @@ def get_storage_quota():
     return object_store.get_global_storage_stats()
 
 
+class SettingsUpdate(BaseModel):
+    gemini_api_key: Optional[str] = None
+    openai_api_key: Optional[str] = None
+    provider: Optional[str] = "gemini"
+
+
+@app.get("/api/settings")
+def get_settings():
+    """Retrieve current LLM provider and API key status."""
+    return default_llm_provider.get_status()
+
+
+@app.post("/api/settings")
+def update_settings(payload: SettingsUpdate):
+    """Update API keys and active LLM provider."""
+    if payload.gemini_api_key is not None:
+        default_llm_provider.set_api_key(payload.gemini_api_key, provider="gemini")
+    elif payload.openai_api_key is not None:
+        default_llm_provider.set_api_key(payload.openai_api_key, provider="openai")
+    return default_llm_provider.get_status()
+
+
 FRONTEND_DIST = Path(__file__).parent.parent.parent / "frontend" / "dist"
 
-if FRONTEND_DIST.exists():
+if FRONTEND_DIST.exists() and (FRONTEND_DIST / "assets").exists():
     app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST / "assets")), name="assets")
+
 
 
 @app.get("/{full_path:path}")

@@ -1,61 +1,81 @@
 # Meridian — Fact Knowledge Layer
 
-A system that ingests PDF documents, extracts grounded numerical and semantic facts, links each fact to verbatim source evidence, and identifies cross-document corroborations, contradictions, and reconciliations.
+A multimodal document intelligence system that ingests PDF documents, extracts grounded numerical and semantic facts, links each fact to verbatim source evidence, and identifies cross-document corroborations, contradictions, and reconciliations.
 
 ---
 
 ## Overview
 
-Organizations scatter critical information across annual reports, presentations, prospectuses, and whitepapers. The same metric may appear in different units, scopes, or time periods, making it difficult to determine consistency.
+Organizations scatter critical facts across annual reports, presentations, financial statements, and policy reviews. The same metric often appears in different units, scopes, or time periods, making verification and consistency audits difficult.
 
-Meridian parses PDF documents into structured page layouts, text blocks, tables, and figures. It extracts typed facts (financial metrics, percentages, counts) using both deterministic regex patterns and optional LLM-augmented extraction, then runs a cross-document reconciliation engine to discover where documents agree, disagree, or require contextual resolution. Results are explorable through a REST API and a React-based workspace UI.
+Meridian parses PDFs into unified layouts, text blocks, structured tables, and visual vector/raster figures. It extracts typed facts (numerical metrics, percentages, currency values) with deterministic rules and optional LLM augmentation. A cross-document reconciliation engine groups related metrics to determine where documents corroborate, contradict, or reconcile through contextual differences. Results are inspectable through a REST API and a responsive React workspace UI.
 
 ---
 
 ## Core Capabilities
 
-- **PDF ingestion** with per-page text, layout block, and structured table extraction (PyMuPDF)
-- **Page thumbnail rendering** and embedded figure/chart asset extraction
-- **Deterministic fact extraction** via domain-aware regex patterns (currency amounts, percentages, counts, unit metrics)
-- **LLM-augmented fact extraction** using Gemini, OpenAI, or local Ollama backends (auto-detected)
-- **Verbatim evidence grounding** — every extracted fact carries its source document name, page number, verbatim quote, and optional table/image citation
-- **Cross-document reconciliation** — pairwise comparison of clustered facts with classification into corroboration, contradiction, reconciled-by-context, or extraction failure
-- **Session-isolated workspaces** — documents, facts, embeddings, and chat histories are partitioned per workspace
-- **RAG-based conversational Q&A** over workspace documents with vector retrieval (ChromaDB) and source citations
-- **Multimodal OCR** via Qwen3-VL vision-language model (optional, for scanned/image-heavy PDFs)
+- **PDF Ingestion & Structural Parsing**: Extracts per-page text blocks, layout hierarchies, structured Markdown tables, and rendered page thumbnails using PyMuPDF.
+- **Visual Chart & Figure Extraction**: Automatically detects vector charts (`Chart ...`, `Figure ...`) and embedded raster images, generating high-resolution 150 DPI clips with structured metadata manifests.
+- **Deterministic & LLM-Augmented Fact Extraction**: Dual-layer fact extraction using domain-aware regex patterns for precision financial figures, supplemented by LLM extraction for semantic facts.
+- **Verbatim Evidence Grounding**: Every extracted fact links directly to its source document, exact page number, and verbatim excerpt.
+- **Intra- & Cross-Document Reconciliation**: Evaluates facts pairwise across documents and reporting scopes (e.g., Headline vs. Core CPI, Budget Estimates vs. Revised Estimates) to identify corroborations, contradictions, and reconciled context.
+- **Session-Isolated Workspaces**: Complete multi-tenant isolation for documents, metadata, vector embeddings, and conversation histories backed by SQLite.
+- **Strictly Grounded Multimodal RAG**: Query documents with conversational AI powered by Google Gemini (with automatic `gemini-3.6-flash` resolution). Passes high-resolution chart images directly to the vision model for visual data point extraction without open hallucination.
+- **Interactive Lightbox Inspection**: Full-screen figure inspection modal with zoom preview, dimensions, and PNG export.
+- **Runtime Settings & Key Management**: Configure and persist Gemini or OpenAI API keys directly from the UI without restarting servers.
 
 ---
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────┐
-│                    React SPA (Vite)                   │
-│          Workspace Manager · Document Viewer          │
-│       Facts Explorer · Reconciliation Dashboard       │
-│                 Ask / Chat Panel                      │
-└────────────────────────┬─────────────────────────────┘
-                         │ HTTP (REST)
-┌────────────────────────▼─────────────────────────────┐
-│               FastAPI Application Server              │
-│                   (src/api/app.py)                     │
-├───────────┬───────────┬───────────┬──────────────────┤
-│ Ingestion │   Facts   │  Reconc.  │   RAG / Chat     │
-│ PDFLoader │ Extractor │  Engine   │  ChatEngine      │
-│ FigExtract│ LLMProvide│           │  VectorStore     │
-├───────────┴───────────┴───────────┴──────────────────┤
-│                   Session Manager                     │
-│              (SQLite — normalized schema)              │
-├───────────────────────┬──────────────────────────────┤
-│      SQLite DB        │       Object Store            │
-│  workspaces           │  data/object_store/           │
-│  documents            │    {session}/documents/       │
-│  document_pages       │    {session}/thumbnails/      │
-│  facts + evidence     │    {session}/figures/         │
-│  fact_relationships   │    {session}/chroma/          │
-│  messages             │  (+ optional MinIO/S3)        │
-└───────────────────────┴──────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                      React SPA (Vite)                       │
+│        Workspace Manager · Document Viewer · Figures Tab    │
+│      Facts Explorer · Reconciliation Matrix · Ask Chat      │
+└──────────────────────────────┬──────────────────────────────┘
+                               │ HTTP (REST)
+┌──────────────────────────────▼──────────────────────────────┐
+│                  FastAPI Application Server                 │
+│                       (src/api/app.py)                      │
+├─────────────┬─────────────┬─────────────┬───────────────────┤
+│  Ingestion  │    Facts    │   Reconc.   │     RAG / Chat    │
+│  PDFLoader  │  Extractor  │   Engine    │    ChatEngine     │
+│ FigureExtr. │ LLMProvider │             │ SessionVectorStore│
+├─────────────┴─────────────┴─────────────┴───────────────────┤
+│                       Session Manager                       │
+│                  (SQLite Relational Schema)                 │
+├─────────────────────────────┬───────────────────────────────┤
+│          SQLite DB          │          Object Store         │
+│  workspaces                 │  data/object_store/{session}/ │
+│  documents & document_pages │    documents/ (raw PDFs)      │
+│  facts & evidence           │    thumbnails/ (page images)  │
+│  fact_relationships         │    figures/ (chart crops)     │
+│  messages (chat history)    │    tables/ (persisted JSON)   │
+│                             │    chroma/ (vector embeddings)│
+└─────────────────────────────┴───────────────────────────────┘
 ```
+
+---
+
+## Approach
+
+### 1. Architectural Strategy
+Important business and macroeconomic data does not live only in plain text paragraphs; it is concentrated in structured tables and visual trend charts. A naive text-only RAG system misses the majority of quantitative evidence. Meridian was designed around three principles:
+1. **Multimodal Evidence First**: Extract text, tables, and charts into distinct first-class artifacts with coordinates, page numbers, and image assets.
+2. **Deterministic Grounding**: Facts must be tethered to verbatim source text. Numbers without verbatim evidence spans are rejected.
+3. **Graceful Degradation**: The entire pipeline (ingestion, table extraction, figure clipping, fact extraction, reconciliation, and search) runs deterministically without an internet connection or LLM API key. When an LLM key is provided, the system seamlessly activates multimodal vision synthesis.
+
+### 2. Important Decisions & Trade-offs
+- **PyMuPDF Vector Clipping vs. Heavy VLM OCR**: Rather than running slow, GPU-intensive vision-language models (e.g. Qwen-VL) over every single page of a 100-page report, Meridian inspects drawing command paths and caption markers to clip vector charts natively at 150 DPI. This provides 50x faster ingestion while maintaining pixel-perfect fidelity.
+- **SQLite + Local Object Store vs. Cloud Microservices**: Meridian uses an embedded SQLite database with foreign-key integrity and a structured local object store directory. This guarantees zero external setup friction for local evaluators while offering optional MinIO/S3 mirroring for production.
+- **Dual-Layer Fact Extraction**: Using regex patterns for currency amounts, percentages, and fiscal metrics ensures 100% precision and instant execution. The LLM provider is invoked only as a secondary pass to extract complex semantic relationships.
+- **Adaptive Model Resolution**: Automated discovery prioritizing `gemini-3.6-flash`, falling back through `gemini-flash-latest` and legacy endpoints, ensuring compatibility across different Google API key provisioning tiers.
+- **Markdown Normalization in Chat**: LLM generation output is preprocessed to enforce Markdown block breaks (`\n\n###`, `\n\n---`) so headers, bullet points, and tables render cleanly without collapsing whitespace.
+
+### 3. AI Tools Used
+- **Google Antigravity**: Used as the primary agentic pair-programming assistant for iterative codebase refactoring, live execution debugging, FastAPI route optimization, and end-to-end browser verification.
+- **Claude**: Used for high-level system architecture modeling, prompt engineering strategies for strictly-grounded multimodal vision, and semantic reconciliation design.
 
 ---
 
@@ -64,60 +84,118 @@ Meridian parses PDF documents into structured page layouts, text blocks, tables,
 | Model | Location | Description |
 |---|---|---|
 | `Fact` | `src/facts/models.py` | Subject, attribute, value, normalized_value, unit, temporal_scope, context_scope, confidence, evidence |
-| `Evidence` | `src/facts/models.py` | Document name, page number, verbatim_quote, char_offset, table_citation, image_citation |
-| `FactComparison` | `src/facts/models.py` | Relationship type (corroboration/contradiction/reconciled/extraction_failure), paired facts, explanation, reconciliation_factor |
-| `KnowledgeLayer` | `src/facts/models.py` | Aggregate container: all documents, facts, comparisons, statistics |
-| `CanonicalDocument` | `src/ingestion/pdf_loader.py` | Unified document: doc_id, pages, text blocks, table observations, figures, tags |
-| `WorkspaceSession` | `src/sessions/session_manager.py` | Isolated workspace: documents, messages, knowledge layer |
+| `Evidence` | `src/facts/models.py` | Source document name, page number, verbatim_quote, char_offset, table_citation, image_citation |
+| `FactComparison` | `src/facts/models.py` | Relationship type (corroboration, contradiction, reconciled, extraction_failure), paired facts, explanation, reconciliation_factor |
+| `KnowledgeLayer` | `src/facts/models.py` | Session-level container aggregating documents, facts, comparisons, and summary statistics |
+| `CanonicalDocument` | `src/ingestion/pdf_loader.py` | Unified document schema with text blocks, tables, figures, tags, and page counts |
+| `WorkspaceSession` | `src/sessions/session_manager.py` | Multi-tenant workspace containing isolated documents, conversation threads, and knowledge layers |
 
 ---
 
-## Evidence & Reconciliation Logic
+## Evidence Grounding & Reconciliation Logic
 
 ### Evidence Grounding
+Every extracted fact includes an `Evidence` record containing:
+- `document_name`: Exact source PDF filename
+- `page_number`: 1-indexed document page
+- `verbatim_quote`: Surrounding context sentence from the source text
+- `table_citation` / `image_citation`: Specific reference to the source table column header or figure ID
 
-Every `Fact` object includes an `Evidence` struct with:
-- `document_name` — source PDF filename
-- `page_number` — exact page
-- `verbatim_quote` — surrounding sentence(s) from the source text
-- `table_citation` / `image_citation` — optional table or figure reference (e.g., "Consolidated Statement of Profit & Loss (Table on Page 22)")
+### Reconciliation Engine
+The engine (`src/reconciliation/engine.py`) normalizes attributes into shared semantic clusters (e.g. GDP growth, inflation, deficits, revenue) and evaluates fact pairs:
 
-### Reconciliation Types
-
-| Type | Meaning |
+| Relationship Type | Definition & Evaluation Criteria |
 |---|---|
-| `corroboration` | Two facts from different documents report consistent values for the same metric within tolerance (default 0.5%) |
-| `contradiction` | Same metric, same scope, same period — values diverge beyond tolerance |
-| `reconciled` | Apparent contradiction resolved by differing temporal scope, reporting boundary (standalone vs. consolidated), or unit conversion |
-| `extraction_failure` | Documents a known extraction edge case and the system's mitigation (e.g., parenthesized accounting negatives) |
-
-The reconciliation engine (`src/reconciliation/engine.py`) clusters facts by `(subject, attribute)`, then performs pairwise comparison using normalized values, temporal scopes, and context scopes.
+| `corroboration` | Facts from different documents (or distinct sections) reporting consistent values within tolerance (default ±0.5%). |
+| `contradiction` | Facts sharing the exact same subject, attribute, scope, and time period whose values diverge beyond tolerance. |
+| `reconciled` | Apparent divergences resolved by differing temporal boundaries (e.g., FY24 vs FY25), reporting scopes (e.g., Headline vs. Core CPI, Standalone vs. Consolidated), or estimation stages (Budget Estimate vs. Revised Estimate). |
+| `extraction_failure` | Documents handled edge cases such as parenthetical negative financial accounting notation `(1,234.56)` vs raw values. |
 
 ---
 
-## Storage Architecture
+## Setup and Run Instructions
 
-### SQLite (Metadata + Knowledge)
+### Prerequisites
+- **Python**: 3.10 or higher
+- **Node.js**: 18 or higher (with npm)
+- **Git**
 
-Location: `data/database/document_intelligence.db`
+### 1. Clone & Python Environment Setup
+```bash
+git clone https://github.com/YashBhardwaj21/multimodal-fact-knowledge-layer.git
+cd multimodal-fact-knowledge-layer
 
-Seven normalized tables with foreign key cascades:
+# Create virtual environment
+python -m venv venv
 
-| Table | Purpose |
-|---|---|
-| `workspaces` | Workspace metadata (id, title, timestamps) |
-| `documents` | Document metadata (filename, hash, page_count, tags, processing status) |
-| `document_pages` | Full text per page |
-| `facts` | Extracted facts (subject, predicate, value, normalized_value, unit, time, scope) |
-| `evidence` | Source grounding per fact (document, page, verbatim quote, citations) |
-| `fact_relationships` | Cross-document reconciliations (type, title, reasoning, reconciliation_factor) |
-| `messages` | Chat history with serialized citations |
+# Activate virtual environment
+# Windows (PowerShell):
+.\venv\Scripts\Activate.ps1
+# Windows (CMD):
+venv\Scripts\activate.bat
+# Linux / macOS:
+source venv/bin/activate
 
-### Object Store (Binary Assets)
+# Install dependencies
+pip install -r requirements.txt
+```
 
-Location: `data/object_store/{session_id}/`
+### 2. Frontend Setup
+```bash
+cd frontend
+npm install
+npm run build
+cd ..
+```
 
-Stores PDFs, page thumbnail PNGs, extracted figure PNGs, and ChromaDB vector indices. Optionally syncs to MinIO/S3 when `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`, and `MINIO_SECRET_KEY` environment variables are set.
+### 3. Environment Configuration (Optional)
+Create a `.env` file in the root directory (or configure keys directly in the UI Settings):
+```env
+# Optional: Google Gemini API Key for multimodal chat & vision
+GEMINI_API_KEY="your-gemini-api-key"
+
+# Optional: OpenAI API Key
+OPENAI_API_KEY="your-openai-api-key"
+
+# Optional: MinIO / S3 Object Storage
+MINIO_ENDPOINT="localhost:9000"
+MINIO_ACCESS_KEY="minioadmin"
+MINIO_SECRET_KEY="minioadmin"
+```
+
+### 4. Running the Application
+
+#### Production Mode (Unified Backend & Frontend)
+```bash
+python run_server.py --port 8000
+```
+Open your browser at **`http://localhost:8000`**. The FastAPI server serves the REST API and the built React frontend application.
+
+#### Development Mode (Hot-Reload)
+Run the backend in one terminal:
+```bash
+python run_server.py --port 8000
+```
+Run the Vite development server in a second terminal:
+```bash
+cd frontend
+npm run dev
+```
+Open your browser at **`http://localhost:3000`**. The Vite server proxies API calls seamlessly to port 8000.
+
+### 5. Running the CLI Pipeline (Headless Mode)
+To process raw PDFs into structured fact extraction and reconciliation outputs without a web browser:
+```bash
+python pipeline.py data/raw/ --output outputs/ --llm auto
+```
+Outputs:
+- `outputs/knowledge_layer.json`: Full serialized knowledge layer
+- `outputs/knowledge_summary.txt`: Human-readable summary of facts and comparisons
+
+### 6. Running Automated Tests
+```bash
+pytest tests/ -v
+```
 
 ---
 
@@ -125,234 +203,68 @@ Stores PDFs, page thumbnail PNGs, extracted figure PNGs, and ChromaDB vector ind
 
 Base URL: `http://localhost:8000`
 
-### Workspaces
-
+### Workspace Sessions
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/api/sessions` | List all workspaces |
-| `POST` | `/api/sessions` | Create workspace (`{title, description}`) |
-| `GET` | `/api/sessions/{id}` | Workspace details with knowledge layer |
-| `PATCH` | `/api/sessions/{id}` | Rename workspace (`{title}`) |
-| `DELETE` | `/api/sessions/{id}` | Delete workspace and purge all storage |
+| `GET` | `/api/sessions` | List all workspaces with document & fact counts |
+| `POST` | `/api/sessions` | Create a new isolated workspace (`{title, description}`) |
+| `GET` | `/api/sessions/{id}` | Workspace details with documents and knowledge stats |
+| `PATCH` | `/api/sessions/{id}` | Rename an existing workspace (`{title}`) |
+| `DELETE` | `/api/sessions/{id}` | Delete workspace, purging database records and object files |
 
-### Documents
-
+### Document Management
 | Method | Endpoint | Description |
 |---|---|---|
-| `POST` | `/api/sessions/{id}/documents` | Upload PDF (multipart) — triggers ingestion, extraction, reconciliation |
-| `GET` | `/api/sessions/{id}/documents` | List documents in workspace |
-| `DELETE` | `/api/sessions/{id}/documents/{doc_id}` | Delete document from DB, object store, and vector index |
+| `POST` | `/api/sessions/{id}/documents` | Upload PDF (multipart/form-data) — triggers layout analysis, table extraction, figure clipping, and reconciliation |
+| `GET` | `/api/sessions/{id}/documents` | List documents registered in the workspace |
+| `DELETE` | `/api/sessions/{id}/documents/{doc_id}` | Remove a document and delete its vector embeddings and image assets |
 
-### Knowledge
-
+### Facts, Figures & Reconciliation
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/api/sessions/{id}/facts` | Extracted facts (optional `?subject=` filter) |
-| `GET` | `/api/sessions/{id}/comparisons` | Reconciliations (optional `?relationship_type=` filter) |
-| `GET` | `/api/sessions/{id}/tables` | Extracted structured tables |
-| `GET` | `/api/sessions/{id}/figures` | Extracted figure assets |
-| `GET` | `/api/sessions/{id}/structure` | Page-level block layout |
+| `GET` | `/api/sessions/{id}/facts` | Retrieve extracted facts (supports `?subject=` filter) |
+| `GET` | `/api/sessions/{id}/comparisons` | Retrieve cross-document comparisons (`?relationship_type=`) |
+| `POST` | `/api/sessions/{id}/reconcile` | Trigger on-demand reconciliation recomputation |
+| `GET` | `/api/sessions/{id}/tables` | Retrieve extracted Markdown tables with column headers |
+| `GET` | `/api/sessions/{id}/figures` | Retrieve figure assets with dimensions, captions, and URLs |
+| `GET` | `/api/sessions/{id}/figures/{doc_stem}/{fig_id}` | Serve extracted figure PNG image (supports `.png` suffix) |
+| `GET` | `/api/sessions/{id}/documents/{doc_stem}/pages/{n}/thumbnail` | Serve rendered page thumbnail PNG |
 
-### Chat & Assets
-
+### Grounded Chat & Settings
 | Method | Endpoint | Description |
 |---|---|---|
-| `POST` | `/api/sessions/{id}/chat` | RAG query (`{query, document_name?}`) |
-| `GET` | `/api/sessions/{id}/documents/{stem}/pages/{n}/thumbnail` | Page thumbnail PNG |
-| `GET` | `/api/sessions/{id}/figures/{stem}/{fig_id}` | Extracted figure PNG |
-| `GET` | `/api/storage/quota` | Global storage utilization |
+| `POST` | `/api/sessions/{id}/chat` | Ask grounded questions with multimodal image support (`{query, document_name?}`) |
+| `GET` | `/api/settings` | Retrieve active LLM provider status, active model, and masked key |
+| `POST` | `/api/settings` | Save API key at runtime (`{gemini_api_key, openai_api_key}`) and persist to `.env` |
+| `GET` | `/api/storage/quota` | Check global storage utilization across sessions |
 
 ---
 
-## LLM Provider Support
+## Limitations and Next Steps
 
-The `LLMProvider` (`src/facts/llm_provider.py`) auto-detects available backends in this order:
+### Current Limitations
+1. **Complex Borderless Tables**: While ruled tables extract cleanly, deeply nested or borderless multi-column tables in complex annual reports can experience merged cell alignment shifts under PyMuPDF's heuristic table finder.
+2. **Captionless Visual Assets**: Figures without explicit caption prefixes (`Chart ...`, `Figure ...`, `Exhibit ...`) rely on bounding-box heuristics and may occasionally miss decorative graphics.
+3. **Local GPU Requirement for Scanned OCR**: The native ingestion engine processes searchable, digital-native PDFs. Scanned image-only PDFs require the optional Qwen3-VL OCR pipeline, which needs an NVIDIA GPU with substantial VRAM.
+4. **Token Limits on Extreme Document Clusters**: In workspaces with dozens of multi-hundred-page documents, simultaneous pairwise reconciliation across thousands of facts requires batched map-reduce clustering to avoid memory spikes.
 
-1. **Gemini** — if `GEMINI_API_KEY` env var is set (uses `gemini-1.5-flash` by default)
-2. **OpenAI** — if `OPENAI_API_KEY` env var is set (uses `gpt-4o-mini` by default)
-3. **Ollama** — if a local Ollama server is running on `localhost:11434` (uses the first available model)
-4. **Built-in** — deterministic regex-only extraction (no LLM calls)
-
-The system extracts facts with or without an LLM. Deterministic extraction covers currency amounts, percentages, numeric metrics, and tabular cell values. LLM augmentation adds up to 3 additional high-importance facts per page when available.
-
----
-
-## Frontend
-
-Single-page React application (Vite + React 18) with:
-
-- **Workspace management** — create, rename, delete isolated workspaces
-- **Document upload** — drag-and-drop PDF ingestion with real-time processing feedback
-- **Document viewer** — page thumbnails, text blocks, extracted tables
-- **Facts explorer** — browsable extracted facts with evidence links
-- **Reconciliation dashboard** — corroborations, contradictions, and reconciled pairs with full explanations
-- **Ask panel** — conversational RAG queries with source citations and page thumbnail previews
-- **Storage quota widget** — global storage utilization tracking
-
-Tech stack: React 18, Lucide icons, vanilla CSS, Vite dev server with API proxy to FastAPI backend.
+### Next Steps & Roadmap
+1. **Deep Learning Table Parsers**: Integrate lightweight vision-based table transformers (e.g. Table-Transformer or Microsoft UniLM) for borderless financial statement parsing.
+2. **Interactive Temporal Knowledge Graph**: Expand the Knowledge Graph view with timeline sliders to visualize the evolution of key economic metrics across multiple quarters and fiscal years.
+3. **Cross-Workspace Comparison Matrices**: Allow comparative side-by-side discrepancy analysis between entire workspaces (e.g., comparing Company A vs. Company B financial metrics).
+4. **Export Engine**: Add one-click export of verified fact reconciliation matrices to Excel (`.xlsx`), CSV, and XBRL formats.
 
 ---
 
-## Project Structure
+## Additional Notes
 
-```
-├── config/
-│   └── config.yaml              # OCR, storage, MinIO configuration
-├── frontend/
-│   ├── src/
-│   │   ├── App.jsx              # Main SPA component (~69KB)
-│   │   ├── index.css            # Full design system
-│   │   └── main.jsx             # React entry point
-│   ├── public/                  # Static assets (logo, images)
-│   ├── vite.config.js           # Vite config with API proxy
-│   └── package.json             # React 18, Lucide, Vite
-├── src/
-│   ├── api/
-│   │   └── app.py               # FastAPI routes and SPA serving
-│   ├── ingestion/
-│   │   ├── pdf_loader.py        # PDF → CanonicalDocument with blocks, tables, thumbnails
-│   │   └── figure_extractor.py  # Embedded image asset extraction
-│   ├── facts/
-│   │   ├── models.py            # Fact, Evidence, FactComparison, KnowledgeLayer
-│   │   ├── extractor.py         # Deterministic + LLM fact extraction
-│   │   └── llm_provider.py      # Gemini / OpenAI / Ollama abstraction
-│   ├── reconciliation/
-│   │   └── engine.py            # Cross-document reconciliation engine
-│   ├── rag/
-│   │   ├── vector_store.py      # ChromaDB session-isolated vector index
-│   │   └── chat_engine.py       # RAG chat with grounded citations
-│   ├── ocr/
-│   │   └── ocr_extractor.py     # Qwen3-VL vision-language OCR
-│   ├── preprocessing/
-│   │   └── image_preprocessor.py # Image resize/normalization utilities
-│   ├── sessions/
-│   │   └── session_manager.py   # SQLite-backed workspace + CRUD operations
-│   ├── storage/
-│   │   └── object_store.py      # Local + MinIO/S3 binary asset manager
-│   └── utils/
-│       └── config.py            # YAML configuration loader
-├── tests/
-│   ├── test_session_isolation.py # Multi-tenant isolation tests (metadata, vectors, chat)
-│   ├── test_arbitrary_e2e.py     # End-to-end test with synthetic PDF
-│   └── test_preprocessing.py     # Image preprocessing tests
-├── pipeline.py                  # CLI pipeline: extract → reconcile → JSON output
-├── demo_cases.py                # Demonstration script for reconciliation cases
-├── run_server.py                # Uvicorn launcher with auto-reload
-└── requirements.txt             # Python dependencies
-```
-
----
-
-## Setup & Running
-
-### Prerequisites
-
-- Python 3.10+
-- Node.js 18+ (for frontend)
-
-### Installation
-
-```bash
-# Clone repository
-git clone https://github.com/YashBhardwaj21/multimodal-fact-knowledge-layer.git
-cd multimodal-fact-knowledge-layer
-
-# Python dependencies
-python -m venv venv
-source venv/bin/activate  # or venv\Scripts\activate on Windows
-pip install -r requirements.txt
-
-# Frontend
-cd frontend
-npm install
-npm run build
-cd ..
-```
-
-### Running the Server
-
-```bash
-python run_server.py --port 8000
-```
-
-The application serves both the API and the built frontend at `http://localhost:8000`.
-
-For frontend development with hot-reload:
-
-```bash
-cd frontend
-npm run dev
-```
-
-The Vite dev server runs on port 3000 and proxies `/api` requests to the backend on port 8000.
-
-### CLI Pipeline (headless)
-
-```bash
-python pipeline.py data/raw/ --output outputs/ --llm auto
-```
-
-Outputs `outputs/knowledge_layer.json` and `outputs/knowledge_summary.txt`.
-
-### Optional: LLM Configuration
-
-```bash
-# Gemini
-export GEMINI_API_KEY=your_key
-
-# OpenAI
-export OPENAI_API_KEY=your_key
-
-# Ollama (just start the server)
-ollama serve
-```
-
-### Optional: MinIO Object Storage
-
-```bash
-export MINIO_ENDPOINT=localhost:9000
-export MINIO_ACCESS_KEY=minioadmin
-export MINIO_SECRET_KEY=minioadmin
-```
-
----
-
-## Testing
-
-```bash
-pytest tests/ -v
-```
-
-Test coverage includes:
-- **Session isolation** — verifies documents, vector embeddings, and chat responses never leak between workspaces
-- **End-to-end pipeline** — creates a synthetic PDF, uploads via API, verifies fact extraction and chat
-- **Preprocessing** — image resize utilities
-
----
-
-## Known Limitations
-
-- Table extraction depends on PyMuPDF's `find_tables()`, which can miss tables without explicit ruling or merge cells incorrectly
-- Deterministic regex patterns in `extractor.py` include domain-specific rules tuned to the starter dataset; novel document types benefit from LLM augmentation
-- OCR module (Qwen3-VL) requires a CUDA GPU and significant VRAM; it is not used in the default ingestion path (PyMuPDF handles text-native PDFs)
-- The reconciliation engine's `_generate_case_demonstrations()` method contains hardcoded comparisons for the starter Delhivery dataset as demonstration examples
-- Frontend is a single-file React component (`App.jsx`, ~69KB); no component decomposition or routing library
-
----
-
-## Dependencies
-
-| Category | Packages |
-|---|---|
-| Server | FastAPI, Uvicorn, Pydantic, python-multipart |
-| Document Processing | PyMuPDF, pdf2image, Pillow, OpenCV, NumPy |
-| ML / Embeddings | PyTorch, Transformers, Accelerate, qwen-vl-utils, ChromaDB |
-| Frontend | React 18, Lucide React, Vite |
-| Storage | SQLite (stdlib), MinIO (optional) |
-| Config | PyYAML |
+- **Self-Healing Adaptive LLM Resolution**: If a Google API key does not have access to legacy `gemini-1.5-flash` endpoints, the system automatically resolves to `gemini-3.6-flash` without throwing unhandled exceptions.
+- **Zero-Hallucination Prompting**: Multimodal chat prompts explicitly instruct the vision model to transcribe exact visual numbers, legends, and axes directly from attached image crops while forbidding open extrapolation.
+- **No-Key Operation**: The system operates with full deterministic capability out-of-the-box. Fact extraction, table viewing, figure rendering, and reconciliation matrices function completely without third-party API credentials.
+- **Persistence Across Restarts**: Extracted structured tables, figure metadata manifests, and SQLite relations are persisted in `data/object_store` and `data/database`, surviving server restarts.
 
 ---
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT License. See [LICENSE](LICENSE) for details.

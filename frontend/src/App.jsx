@@ -1,12 +1,57 @@
 import React, { useState, useEffect, useRef } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import {
   FileText, Upload, Search, MessageSquare, Database, Share2,
   Settings, CheckCircle2, ChevronRight, ArrowLeft, Send,
   ExternalLink, Layers, Table, Image, ShieldCheck, Sparkles, Plus,
   Bookmark, HelpCircle, HardDrive, RefreshCw, X, Folder, ChevronDown,
   Edit2, Trash2, MoreVertical, AlertTriangle, GitCompare, ShieldAlert,
-  Download, ZoomIn
+  Download, ZoomIn, RotateCcw
 } from 'lucide-react';
+
+function FormattedMarkdown({ content }) {
+  if (!content) return null;
+
+  // Pre-process markdown to ensure headings, dividers, and lists have proper blank line breaks
+  const normalized = content
+    .replace(/\r\n/g, '\n')
+    // Guarantee empty line before headings (###) so Markdown parses them as block elements
+    .replace(/([^\n])\n(#{1,6}\s)/g, '$1\n\n$2')
+    // Guarantee empty line before and after dividers (---)
+    .replace(/([^\n])\n(---|__|\*\*\*)\n/g, '$1\n\n$2\n\n')
+    // Guarantee empty line before lists following text
+    .replace(/([^\n])\n([*+-]|\d+\.)\s/g, '$1\n\n$2 ');
+
+  try {
+    return (
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          h1: ({ node, ...props }) => <h3 className="chat-h3" {...props} />,
+          h2: ({ node, ...props }) => <h3 className="chat-h3" {...props} />,
+          h3: ({ node, ...props }) => <h3 className="chat-h3" {...props} />,
+          h4: ({ node, ...props }) => <h4 className="chat-h4" {...props} />,
+          p: ({ node, ...props }) => <p className="chat-p" {...props} />,
+          ul: ({ node, ...props }) => <ul className="chat-ul" {...props} />,
+          ol: ({ node, ...props }) => <ol className="chat-ol" {...props} />,
+          li: ({ node, ...props }) => <li className="chat-li" {...props} />,
+          hr: ({ node, ...props }) => <hr className="chat-hr" {...props} />,
+          strong: ({ node, ...props }) => <strong className="chat-strong" {...props} />,
+          table: ({ node, ...props }) => (
+            <div className="chat-table-wrapper">
+              <table className="chat-table" {...props} />
+            </div>
+          )
+        }}
+      >
+        {normalized}
+      </ReactMarkdown>
+    );
+  } catch (e) {
+    return <div style={{ whiteSpace: 'pre-wrap' }}>{content}</div>;
+  }
+}
 
 export default function App() {
   // Navigation view: 'landing' | 'workspace'
@@ -55,6 +100,48 @@ export default function App() {
   const [previewFigure, setPreviewFigure] = useState(null);
   const [reconciliationFilter, setReconciliationFilter] = useState('all');
   const [isReconciling, setIsReconciling] = useState(false);
+
+  // Settings modal state
+  const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [settingsData, setSettingsData] = useState({ provider: 'builtin', is_active: false, model_name: 'builtin', has_gemini: false, masked_key: '' });
+  const [inputGeminiKey, setInputGeminiKey] = useState('');
+  const [settingsSaving, setSettingsSaving] = useState(false);
+  const [settingsMessage, setSettingsMessage] = useState('');
+
+  const fetchSettings = async () => {
+    try {
+      const res = await fetch('/api/settings');
+      const data = await res.json();
+      setSettingsData(data);
+    } catch (e) {
+      console.error('Settings fetch error:', e);
+    }
+  };
+
+  const handleSaveSettings = async (e) => {
+    if (e) e.preventDefault();
+    setSettingsSaving(true);
+    setSettingsMessage('');
+    try {
+      const res = await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ gemini_api_key: inputGeminiKey.trim() })
+      });
+      const data = await res.json();
+      setSettingsData(data);
+      setSettingsMessage(data.has_gemini ? 'Gemini API key saved & active!' : 'API key cleared. Built-in mode active.');
+      setInputGeminiKey('');
+    } catch (err) {
+      setSettingsMessage('Error saving key: ' + err.message);
+    } finally {
+      setSettingsSaving(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchSettings();
+  }, []);
 
   const handleRecomputeReconciliation = async () => {
     if (!currentSessionId) return;
@@ -434,6 +521,17 @@ export default function App() {
     }
   };
 
+  const handleResetChat = () => {
+    setChatMessages([
+      {
+        id: `welcome_${Date.now()}`,
+        role: 'assistant',
+        content: `Welcome to **${sessionData?.title || 'Interactive Workspace Chat'}**. Ask any question across your uploaded documents, extracted tables, and visual charts!`,
+        citations: []
+      }
+    ]);
+  };
+
   const allTags = Array.from(
     new Set((sessionData?.documents || []).flatMap(d => d.tags || []))
   );
@@ -611,7 +709,13 @@ export default function App() {
 
         {/* Right: Actions */}
         <div className="nav-actions">
-          <button className="btn-outline" onClick={() => handleCreateSession(true)}>
+          <button className="btn-outline" onClick={() => {
+            if (navSection !== 'Ask') {
+              setNavSection('Ask');
+              setActiveTab('Chat');
+            }
+            handleResetChat();
+          }} title="Start a fresh chat in this workspace">
             <Plus size={16} /> New Chat
           </button>
           <button className="btn-primary" onClick={() => setShowUploadModal(true)}>
@@ -672,6 +776,14 @@ export default function App() {
             >
               <Share2 size={18} />
               <span>Knowledge Graph</span>
+            </div>
+            <div
+              className="sidebar-item"
+              onClick={() => { setShowSettingsModal(true); fetchSettings(); }}
+              title="Configure Gemini API Key & Model Settings"
+            >
+              <Settings size={18} />
+              <span>Settings</span>
             </div>
           </div>
 
@@ -760,15 +872,26 @@ export default function App() {
                     {selectedDoc ? `Focused: ${selectedDoc.title}` : 'All Workspace Documents'}
                   </span>
                 </div>
-                {selectedDoc && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  {selectedDoc && (
+                    <button
+                      className="btn-outline"
+                      style={{ fontSize: '0.78rem', padding: '5px 12px' }}
+                      onClick={() => setSelectedDoc(null)}
+                    >
+                      Query All Documents
+                    </button>
+                  )}
                   <button
                     className="btn-outline"
-                    style={{ fontSize: '0.78rem', padding: '5px 12px' }}
-                    onClick={() => setSelectedDoc(null)}
+                    style={{ fontSize: '0.78rem', padding: '5px 12px', display: 'flex', alignItems: 'center', gap: '5px' }}
+                    onClick={handleResetChat}
+                    title="Clear current messages and start a fresh chat"
                   >
-                    Query All Documents
+                    <RotateCcw size={12} />
+                    <span>Reset Chat</span>
                   </button>
-                )}
+                </div>
               </div>
 
               {/* Chat Stream */}
@@ -786,53 +909,172 @@ export default function App() {
 
                     <div className="ai-content-body">
                       <div className="ai-text-narrative">
-                        {msg.content}
+                        {msg.role === 'assistant' ? (
+                          <FormattedMarkdown content={msg.content} />
+                        ) : (
+                          msg.content
+                        )}
                       </div>
 
                       {/* Source Evidence Cards */}
                       {msg.citations && msg.citations.length > 0 && (
-                        <div className="source-evidence-card">
-                          <div className="evidence-badge-header">
-                            <span>Source Evidence</span>
-                            <span className="evidence-page-chip">Page {msg.citations[0].page_number}</span>
-                          </div>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', marginTop: '12px' }}>
+                          {msg.citations.slice(0, 4).map((cit, citIdx) => {
+                            const isFigure = cit.citation_type === 'figure';
+                            const isTable = cit.citation_type === 'table';
+                            const figImgUrl = cit.image_url || cit.thumbnail_url;
+                            const caption = (cit.verbatim_quote || '')
+                              .replace(/^\[Visual Asset\]\s*/i, '')
+                              .replace(/^\[Structured Table\]\s*/i, '');
 
-                          <div className="evidence-snippet-preview">
-                            <div className="evidence-mini-thumb">
-                              <img
-                                src={msg.citations[0].thumbnail_url}
-                                alt="Source Page"
-                                onError={(e) => { e.target.style.display = 'none'; }}
-                              />
-                            </div>
-                            <p className="evidence-quote-text">
-                              "{msg.citations[0].verbatim_quote}"
-                            </p>
-                          </div>
+                            if (isFigure) {
+                              return (
+                                <div key={citIdx} className="evidence-figure-card">
+                                  <div className="evidence-badge-header">
+                                    <div className="evidence-badge-left">
+                                      <Image size={14} color="var(--primary)" />
+                                      <span className="evidence-type-title">Visual Evidence</span>
+                                      <span className="evidence-doc-stem">{cit.document_name}</span>
+                                    </div>
+                                    <span className="evidence-page-chip">Page {cit.page_number}</span>
+                                  </div>
+
+                                  <div className="evidence-figure-body">
+                                    <div
+                                      className="evidence-figure-preview"
+                                      onClick={() => setPreviewFigure({
+                                        url: figImgUrl,
+                                        caption: caption,
+                                        page_number: cit.page_number,
+                                        figure_id: 'visual_citation'
+                                      })}
+                                      title="Click to zoom / inspect high-resolution chart"
+                                    >
+                                      <img
+                                        src={figImgUrl}
+                                        alt={caption}
+                                        className="evidence-figure-img"
+                                        onError={(e) => {
+                                          e.currentTarget.style.display = 'none';
+                                          const fb = e.currentTarget.parentElement?.querySelector('.evidence-figure-fallback');
+                                          if (fb) fb.style.display = 'flex';
+                                        }}
+                                      />
+                                      <div className="evidence-figure-fallback" style={{ display: 'none' }}>
+                                        <Image size={24} color="var(--text-muted)" />
+                                        <span>Visual diagram preview</span>
+                                      </div>
+                                      <div className="evidence-figure-zoom-overlay">
+                                        <ZoomIn size={13} /> Click to inspect high-res diagram
+                                      </div>
+                                    </div>
+
+                                    <div className="evidence-figure-caption-bar">
+                                      <span className="evidence-figure-caption-text">{caption}</span>
+                                      <button
+                                        type="button"
+                                        className="evidence-inspect-btn"
+                                        onClick={() => setPreviewFigure({
+                                          url: figImgUrl,
+                                          caption: caption,
+                                          page_number: cit.page_number,
+                                          figure_id: 'visual_citation'
+                                        })}
+                                      >
+                                        <ZoomIn size={12} /> Inspect
+                                      </button>
+                                    </div>
+                                  </div>
+                                </div>
+                              );
+                            }
+
+                            return (
+                              <div key={citIdx} className="source-evidence-card">
+                                <div className="evidence-badge-header">
+                                  <div className="evidence-badge-left">
+                                    {isTable ? <Table size={13} color="var(--primary)" /> : <FileText size={13} color="var(--primary)" />}
+                                    <span>{isTable ? 'Structured Table' : 'Source Evidence'}</span>
+                                    <span className="evidence-doc-stem">{cit.document_name}</span>
+                                  </div>
+                                  <span className="evidence-page-chip">Page {cit.page_number}</span>
+                                </div>
+
+                                <div className="evidence-snippet-preview">
+                                  {cit.thumbnail_url && (
+                                    <div
+                                      className="evidence-mini-thumb"
+                                      style={{ cursor: 'pointer' }}
+                                      onClick={() => setPreviewFigure({
+                                        url: cit.thumbnail_url,
+                                        caption: `Page ${cit.page_number} Evidence Thumbnail`,
+                                        page_number: cit.page_number,
+                                        figure_id: `page_${cit.page_number}`
+                                      })}
+                                      title="Click to inspect page thumbnail"
+                                    >
+                                      <img
+                                        src={cit.thumbnail_url}
+                                        alt="Page Evidence"
+                                        onError={(e) => {
+                                          if (e.currentTarget.parentElement) {
+                                            e.currentTarget.parentElement.style.display = 'none';
+                                          }
+                                        }}
+                                      />
+                                    </div>
+                                  )}
+                                  <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', minWidth: 0, flex: 1 }}>
+                                    <p className="evidence-quote-text">
+                                      "{cit.verbatim_quote}"
+                                    </p>
+                                  </div>
+                                </div>
+                              </div>
+                            );
+                          })}
                         </div>
                       )}
                     </div>
                   </div>
                 ))}
+
+                {isAsking && (
+                  <div className="chat-bubble-ai thinking-bubble">
+                    <div className="ai-avatar-icon">
+                      <Sparkles size={16} className="spinning-sparkle" />
+                    </div>
+                    <div className="ai-content-body">
+                      <div className="ai-thinking-indicator">
+                        <span className="ai-thinking-dot"></span>
+                        <span className="ai-thinking-dot"></span>
+                        <span className="ai-thinking-dot"></span>
+                        <span className="ai-thinking-text">Analyzing documents, tables & visual diagrams with Gemini...</span>
+                      </div>
+                    </div>
+                  </div>
+                )}
                 <div ref={chatEndRef} />
               </div>
 
               {/* Search Bar at Bottom Centre */}
               <div className="ask-bottom-center-wrapper">
-                <div className="ask-suggestion-chips-row">
-                  <button className="ask-suggest-chip" onClick={() => handleSendMessage(selectedDoc ? `Summarize ${selectedDoc.title}` : 'Summarize the documents in this workspace')}>
-                    Summarize {selectedDoc ? selectedDoc.title : 'workspace'}
-                  </button>
-                  <button className="ask-suggest-chip" onClick={() => handleSendMessage('What are the key points, instructions, or metrics?')}>
-                    Key points & instructions
-                  </button>
-                  <button className="ask-suggest-chip" onClick={() => handleSendMessage('What specific numbers, figures, or dates are mentioned?')}>
-                    Extract metrics & numbers
-                  </button>
-                  <button className="ask-suggest-chip" onClick={() => handleSendMessage('Are there any conflicting figures or contradictions between documents?')}>
-                    Find contradictions
-                  </button>
-                </div>
+                {chatMessages.length <= 1 && (
+                  <div className="ask-suggestion-chips-row">
+                    <button className="ask-suggest-chip" onClick={() => handleSendMessage(selectedDoc ? `Summarize ${selectedDoc.title}` : 'Summarize the documents in this workspace')}>
+                      Summarize {selectedDoc ? selectedDoc.title : 'workspace'}
+                    </button>
+                    <button className="ask-suggest-chip" onClick={() => handleSendMessage('What are the key points, instructions, or metrics?')}>
+                      Key points & instructions
+                    </button>
+                    <button className="ask-suggest-chip" onClick={() => handleSendMessage('What specific numbers, figures, or dates are mentioned?')}>
+                      Extract metrics & numbers
+                    </button>
+                    <button className="ask-suggest-chip" onClick={() => handleSendMessage('Are there any conflicting figures or contradictions between documents?')}>
+                      Find contradictions
+                    </button>
+                  </div>
+                )}
 
                 <form
                   className="ask-bottom-center-box"
@@ -1488,6 +1730,116 @@ export default function App() {
           </>
         )}
       </main>
+
+      {/* Settings Modal */}
+      {showSettingsModal && (
+        <div className="modal-backdrop" onClick={() => setShowSettingsModal(false)}>
+          <div className="custom-modal-card" style={{ maxWidth: '520px' }} onClick={(e) => e.stopPropagation()}>
+            <div className="custom-modal-header">
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <Settings size={18} color="var(--primary)" />
+                <h3 style={{ margin: 0 }}>API & Model Settings</h3>
+              </div>
+              <button
+                className="custom-modal-close-btn"
+                onClick={() => setShowSettingsModal(false)}
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            <div style={{ padding: '20px', display: 'flex', flexDirection: 'column', gap: '16px' }}>
+              {/* Provider Status Pill */}
+              <div style={{
+                background: settingsData.has_gemini ? 'var(--success-bg)' : '#f5f3ef',
+                border: `1px solid ${settingsData.has_gemini ? 'var(--success)' : 'var(--border-subtle)'}`,
+                borderRadius: '10px',
+                padding: '12px 14px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between'
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  {settingsData.has_gemini ? <CheckCircle2 size={16} color="var(--success)" /> : <Sparkles size={16} color="var(--text-muted)" />}
+                  <div>
+                    <div style={{ fontSize: '0.86rem', fontWeight: 700, color: 'var(--text-title)' }}>
+                      {settingsData.has_gemini ? 'Google Gemini Active' : 'Deterministic Extractor Mode'}
+                    </div>
+                    <div style={{ fontSize: '0.74rem', color: 'var(--text-muted)' }}>
+                      Model: {settingsData.model_name || 'gemini-1.5-flash'} {settingsData.masked_key ? `(${settingsData.masked_key})` : ''}
+                    </div>
+                  </div>
+                </div>
+                <span style={{
+                  fontSize: '0.72rem',
+                  fontWeight: 700,
+                  padding: '3px 8px',
+                  borderRadius: '4px',
+                  background: settingsData.has_gemini ? '#dcfce7' : '#e5e2dc',
+                  color: settingsData.has_gemini ? '#15803d' : '#6b7280'
+                }}>
+                  {settingsData.has_gemini ? 'ONLINE' : 'BUILTIN'}
+                </span>
+              </div>
+
+              {/* API Key Form */}
+              <form onSubmit={handleSaveSettings} style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                <div>
+                  <label style={{ display: 'block', fontSize: '0.82rem', fontWeight: 600, color: 'var(--text-title)', marginBottom: '6px' }}>
+                    Google Gemini API Key
+                  </label>
+                  <input
+                    type="password"
+                    placeholder={settingsData.has_gemini ? "API Key is configured (enter new to update)..." : "Paste your GEMINI_API_KEY here..."}
+                    value={inputGeminiKey}
+                    onChange={(e) => setInputGeminiKey(e.target.value)}
+                    style={{
+                      width: '100%',
+                      padding: '10px 12px',
+                      borderRadius: '8px',
+                      border: '1px solid var(--border-subtle)',
+                      background: '#ffffff',
+                      fontSize: '0.88rem',
+                      color: 'var(--text-title)',
+                      outline: 'none',
+                      boxSizing: 'border-box'
+                    }}
+                  />
+                </div>
+
+                <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.4, background: '#faf8f5', padding: '10px 12px', borderRadius: '8px', border: '1px solid var(--border-subtle)' }}>
+                  🔒 <strong>Grounded Operation Guarantee:</strong> Gemini is strictly constrained to the verified text blocks, structured tables, and visual chart crops extracted in this workspace. No heavy ungrounded computation or open web hallucination.
+                </div>
+
+                {settingsMessage && (
+                  <div style={{ fontSize: '0.82rem', color: settingsMessage.includes('Error') ? 'var(--danger)' : 'var(--success)', fontWeight: 600 }}>
+                    {settingsMessage}
+                  </div>
+                )}
+
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '4px' }}>
+                  <button
+                    type="button"
+                    className="btn-outline"
+                    onClick={() => setShowSettingsModal(false)}
+                    style={{ padding: '8px 16px', fontSize: '0.84rem' }}
+                  >
+                    Close
+                  </button>
+                  <button
+                    type="submit"
+                    className="modal-btn-primary"
+                    disabled={settingsSaving || !inputGeminiKey.trim()}
+                    style={{ padding: '8px 18px', fontSize: '0.84rem' }}
+                  >
+                    {settingsSaving ? 'Saving...' : 'Save API Key'}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Upload Modal */}
       {showUploadModal && (

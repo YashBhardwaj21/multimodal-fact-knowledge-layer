@@ -238,8 +238,43 @@ class ObjectStore:
                     logger.warning(f"Failed to read {meta_path}: {e}")
         return all_meta
 
+    def save_tables_meta(self, session_id: str, doc_name: str, tables: List[Dict[str, Any]]) -> None:
+        """Save metadata json for structured tables extracted from a document."""
+        tab_dir = self.get_tables_dir(session_id) / Path(doc_name).stem
+        tab_dir.mkdir(parents=True, exist_ok=True)
+        meta_path = tab_dir / "tables.json"
+        try:
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(tables, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to save tables metadata: {e}")
+
+    def get_tables_meta(self, session_id: str, doc_name: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Retrieve all extracted tables for a session or document."""
+        tabs_dir = self.get_tables_dir(session_id)
+        if not tabs_dir.exists():
+            return []
+
+        all_tables = []
+        if doc_name:
+            stems = [Path(doc_name).stem]
+        else:
+            stems = [d.name for d in tabs_dir.iterdir() if d.is_dir()]
+
+        for stem in stems:
+            meta_path = tabs_dir / stem / "tables.json"
+            if meta_path.exists():
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                        if isinstance(meta, list):
+                            all_tables.extend(meta)
+                except Exception as e:
+                    logger.warning(f"Failed to read {meta_path}: {e}")
+        return all_tables
+
     def delete_document_files(self, session_id: str, doc_name: str) -> bool:
-        """Purge all binary assets (PDF, thumbnails, figures) for a specific document."""
+        """Purge all binary assets (PDF, thumbnails, figures, tables) for a specific document."""
         stem = Path(doc_name).stem
         deleted = False
 
@@ -270,7 +305,16 @@ class ObjectStore:
             except Exception as e:
                 logger.warning(f"Failed to delete {fig_dir}: {e}")
 
-        # 4. Delete from MinIO if enabled
+        # 4. Delete tables folder for this doc
+        tab_dir = self.get_tables_dir(session_id) / stem
+        if tab_dir.exists():
+            try:
+                shutil.rmtree(tab_dir)
+                deleted = True
+            except Exception as e:
+                logger.warning(f"Failed to delete {tab_dir}: {e}")
+
+        # 5. Delete from MinIO if enabled
         if self.minio_client:
             try:
                 prefix = f"{session_id}/"
